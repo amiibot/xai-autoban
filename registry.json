@@ -6,7 +6,7 @@
       "name": "xAI Autoban",
       "description": "Classify xAI failures (esp. 403) and isolate credentials via CPA Management API; auto re-enable after class TTL.",
       "author": "amiibot",
-      "version": "1.3.3",
+      "version": "1.3.4",
       "repository": "https://github.com/amiibot/xai-autoban",
       "homepage": "https://github.com/amiibot/xai-autoban",
       "license": "MIT",
