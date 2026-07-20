@@ -24,6 +24,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"html"
 	"log/slog"
 	"net/http"
@@ -39,7 +40,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.1.0"
+	pluginVersion = "1.2.0"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -406,8 +407,30 @@ type statusInfo struct {
 	Version          string               `json:"version"`
 	Count            int                  `json:"count"`
 	DeletableClasses []string             `json:"deletable_classes"`
+	Charts           chartBundle          `json:"charts"`
+	QuotaJoin        quotaJoinInfo        `json:"quota_join"`
 	Management       managementStatusInfo `json:"management"`
 	Bans             []banInfo            `json:"bans"`
+}
+
+type chartBundle struct {
+	ByStatus []chartSlice `json:"by_status"`
+	ByClass  []chartSlice `json:"by_class"`
+}
+
+type chartSlice struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
+}
+
+type quotaJoinInfo struct {
+	Enabled bool   `json:"enabled"`
+	OK      bool   `json:"ok"`
+	Path    string `json:"path,omitempty"`
+	Error   string `json:"error,omitempty"`
+	// Matched is how many ban rows found a quota record.
+	Matched int `json:"matched"`
 }
 
 type managementStatusInfo struct {
@@ -429,13 +452,32 @@ type banInfo struct {
 	ManagementDisabled bool   `json:"management_disabled"`
 	Deletable          bool   `json:"deletable"`
 	LastError          string `json:"last_error,omitempty"`
+	// Optional grok-quota join (observe only).
+	Tokens24h   int64  `json:"tokens_24h,omitempty"`
+	QuotaLimit  int64  `json:"quota_limit,omitempty"`
+	QuotaHealth string `json:"quota_health,omitempty"`
+	QuotaEmail  string `json:"quota_email,omitempty"`
+	OverRef     bool   `json:"over_reference,omitempty"`
 }
 
 func currentStatus() statusInfo {
 	now := time.Now()
 	snapshot := bans.snapshot(now)
 	cfg := autoban.config()
+
+	var qidx quotaJoinIndex
+	qinfo := quotaJoinInfo{Enabled: cfg.JoinQuotaState}
+	if cfg.JoinQuotaState {
+		qidx = loadQuotaJoin(cfg.QuotaStateFile)
+		qinfo.OK = qidx.OK
+		qinfo.Path = qidx.Path
+		qinfo.Error = qidx.Error
+	}
+
+	statusCounts := map[int]int{}
+	classCounts := map[string]int{}
 	items := make([]banInfo, 0, len(snapshot))
+	matched := 0
 	for id, entry := range snapshot {
 		remaining := int64(entry.ResetAt.Sub(now).Seconds())
 		if remaining < 0 {
@@ -445,20 +487,112 @@ func currentStatus() statusInfo {
 		if class == "" {
 			class = classLegacy
 		}
-		items = append(items, banInfo{
+		statusCounts[entry.StatusCode]++
+		classCounts[class]++
+		info := banInfo{
 			AuthID: id, AuthIndex: entry.AuthIndex, StatusCode: entry.StatusCode, Class: class, Reason: entry.Reason,
 			BodyFingerprint: entry.BodyFingerprint, BannedAt: entry.BannedAt.Format(time.RFC3339),
 			ResetAt: entry.ResetAt.Format(time.RFC3339), RemainingSeconds: remaining,
 			ManagementDisabled: entry.ManagementDisabled, Deletable: cfg.classDeletable(class), LastError: entry.LastError,
-		})
+		}
+		if cfg.JoinQuotaState && qidx.OK {
+			if q, ok := qidx.lookup(id, entry.AuthIndex, ""); ok {
+				matched++
+				info.Tokens24h = q.Tokens24h
+				if info.Tokens24h == 0 {
+					info.Tokens24h = q.QuotaUsed
+				}
+				info.QuotaLimit = q.QuotaLimit
+				info.QuotaHealth = firstNonEmpty(q.QuotaHealth, q.StatusKind)
+				info.QuotaEmail = q.Email
+				info.OverRef = q.OverRef
+			}
+		}
+		items = append(items, info)
 	}
+	qinfo.Matched = matched
 	sort.Slice(items, func(i, j int) bool { return items[i].ResetAt < items[j].ResetAt })
+
+	charts := chartBundle{
+		ByStatus: buildStatusChart(statusCounts),
+		ByClass:  buildClassChart(classCounts),
+	}
+
 	controller := autoban.status()
 	management := managementStatusInfo{URL: controller.ManagementURL, LastError: controller.LastError}
 	if !controller.BlockedUntil.IsZero() {
 		management.BlockedUntil = controller.BlockedUntil.Format(time.RFC3339)
 	}
-	return statusInfo{Plugin: pluginName, Version: pluginVersion, Count: len(items), DeletableClasses: cfg.deletableClassList(), Management: management, Bans: items}
+	return statusInfo{
+		Plugin: pluginName, Version: pluginVersion, Count: len(items),
+		DeletableClasses: cfg.deletableClassList(), Charts: charts, QuotaJoin: qinfo,
+		Management: management, Bans: items,
+	}
+}
+
+func buildStatusChart(counts map[int]int) []chartSlice {
+	order := []int{401, 402, 403, 429}
+	labels := map[int]string{401: "401 未授权", 402: "402 付费/额度", 403: "403 禁止", 429: "429 限流"}
+	out := make([]chartSlice, 0, len(order)+len(counts))
+	seen := map[int]bool{}
+	for _, code := range order {
+		seen[code] = true
+		if n := counts[code]; n > 0 {
+			out = append(out, chartSlice{Key: fmt.Sprintf("%d", code), Label: labels[code], Count: n})
+		}
+	}
+	// Any other status codes
+	extras := make([]int, 0)
+	for code := range counts {
+		if !seen[code] {
+			extras = append(extras, code)
+		}
+	}
+	sort.Ints(extras)
+	for _, code := range extras {
+		out = append(out, chartSlice{Key: fmt.Sprintf("%d", code), Label: fmt.Sprintf("HTTP %d", code), Count: counts[code]})
+	}
+	return out
+}
+
+func buildClassChart(counts map[string]int) []chartSlice {
+	order := []string{
+		classAuth, classPayment, classQuotaPaid, classQuotaFree,
+		classPermission, classRateLimit, classForbiddenUnknown, classOther, classLegacy,
+	}
+	labels := map[string]string{
+		classAuth: "auth", classPayment: "payment", classQuotaPaid: "quota_paid",
+		classQuotaFree: "quota_free", classPermission: "permission", classRateLimit: "rate_limit",
+		classForbiddenUnknown: "forbidden_unknown", classOther: "other", classLegacy: "legacy",
+	}
+	out := make([]chartSlice, 0, len(order))
+	seen := map[string]bool{}
+	for _, c := range order {
+		seen[c] = true
+		if n := counts[c]; n > 0 {
+			out = append(out, chartSlice{Key: c, Label: labels[c], Count: n})
+		}
+	}
+	extras := make([]string, 0)
+	for c := range counts {
+		if !seen[c] {
+			extras = append(extras, c)
+		}
+	}
+	sort.Strings(extras)
+	for _, c := range extras {
+		out = append(out, chartSlice{Key: c, Label: c, Count: counts[c]})
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func statusPage() string {
@@ -473,6 +607,19 @@ func statusPage() string {
     :root{color-scheme:light;--bg:#f5f7f9;--surface:#fff;--text:#17202a;--muted:#66727f;--line:#dce2e8;--red:#b42318;--red-bg:#fff1f0;--amber:#9a6700;--amber-bg:#fff8db;--blue:#175cd3;--blue-bg:#eff6ff;--green:#067647;--green-bg:#ecfdf3;--shadow:0 1px 2px rgba(16,24,40,.06)}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px;letter-spacing:0}
     header{background:#182230;color:#fff;border-bottom:1px solid #253347}.header-inner{max-width:1440px;margin:auto;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand h1{font-size:21px;line-height:1.2;margin:0}.brand p{margin:5px 0 0;color:#b9c3cf;font-size:13px}.live{display:flex;align-items:center;gap:8px;color:#d5f5e8;font-size:13px}.live-dot{width:8px;height:8px;border-radius:50%;background:#32d583;box-shadow:0 0 0 3px rgba(50,213,131,.18)}
+    .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+    .chart-card{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);padding:16px}
+    .chart-card h2{margin:0 0 4px;font-size:14px}.chart-sub{color:var(--muted);font-size:12px;margin:0 0 12px}
+    .chart-body{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+    .pie{width:148px;height:148px;border-radius:50%;background:#e8eef3;flex:0 0 auto}
+    .pie.empty{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;font-weight:600}
+    .legend{flex:1;min-width:180px;display:flex;flex-direction:column;gap:6px}
+    .legend-row{display:flex;align-items:center;gap:8px;font-size:13px}
+    .swatch{width:10px;height:10px;border-radius:2px;flex:0 0 auto}
+    .legend-label{flex:1;color:#344054}.legend-count{font-variant-numeric:tabular-nums;font-weight:700}
+    .quota-note{font-size:12px;color:var(--muted);margin:0 0 12px}
+    .quota-note.ok{color:var(--green)}.quota-note.warn{color:var(--amber)}
+    @media(max-width:860px){.charts{grid-template-columns:1fr}}
     main{max-width:1440px;margin:auto;padding:20px 24px 36px}.stats{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:12px;margin-bottom:16px}.stat{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:16px;box-shadow:var(--shadow)}.stat-label{font-size:12px;color:var(--muted);font-weight:600}.stat-value{font-size:28px;line-height:1.1;font-weight:750;margin-top:7px}.stat-total{border-left:4px solid var(--blue)}.stat-401{border-left:4px solid #1570ef}.stat-402{border-left:4px solid #f79009}.stat-403{border-left:4px solid #d92d20}.stat-429{border-left:4px solid #7f56d9}
     .toolbar{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);margin-bottom:14px}.toolbar-row{display:flex;align-items:center;gap:10px;padding:12px;flex-wrap:wrap}.toolbar-row+.toolbar-row{border-top:1px solid var(--line)}input[type=search]{height:36px;min-width:260px;flex:1;border:1px solid #bfc8d2;border-radius:6px;padding:0 11px;background:#fff;color:var(--text);font-size:14px}.segments{display:flex;border:1px solid #bfc8d2;border-radius:6px;overflow:hidden}.segments button{border:0;border-right:1px solid #bfc8d2;border-radius:0;background:#fff;color:#344054}.segments button:last-child{border-right:0}.segments button.active{background:#e8eef6;color:#101828;font-weight:700}
     button{height:36px;border:1px solid #bfc8d2;border-radius:6px;background:#fff;color:#273240;padding:0 12px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}button:hover{background:#f2f4f7}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.primary:hover{background:#164ca7}.danger{color:#b42318;border-color:#f1a39b;background:#fff}.danger:hover{background:var(--red-bg)}.quiet-danger{color:#b42318}.spacer{flex:1}.auto{display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.auto input{width:16px;height:16px}.message{min-height:20px;color:var(--muted);font-size:13px}.message.error{color:var(--red)}
@@ -483,7 +630,7 @@ func statusPage() string {
   </style>
 </head>
 <body>
-  <header><div class="header-inner"><div class="brand"><h1>xAI Autoban</h1><p>CPA credential isolation console · v` + pluginVersion + `</p></div><div class="live"><span class="live-dot"></span><span id="syncState">正在连接</span></div></div></header>
+  <header><div class="header-inner"><div class="brand"><h1>xAI Autoban</h1><p>隔离 + 观测（用量只读） · v` + pluginVersion + `</p></div><div class="live"><span class="live-dot"></span><span id="syncState">正在连接</span></div></div></header>
   <main>
     <section class="stats" aria-label="隔离统计">
       <div class="stat stat-total"><div class="stat-label">当前隔离</div><div class="stat-value" id="total">-</div></div>
@@ -492,6 +639,19 @@ func statusPage() string {
       <div class="stat stat-403"><div class="stat-label">403 禁止访问</div><div class="stat-value" id="count403">-</div></div>
       <div class="stat stat-429"><div class="stat-label">429 限流</div><div class="stat-value" id="count429">-</div></div>
     </section>
+    <section class="charts" aria-label="status charts">
+      <div class="chart-card">
+        <h2>HTTP 状态分布</h2>
+        <p class="chart-sub">当前隔离账号的上游状态码占比（仅观测）</p>
+        <div class="chart-body"><div id="pieStatus" class="pie empty">无数据</div><div id="legendStatus" class="legend"></div></div>
+      </div>
+      <div class="chart-card">
+        <h2>失败 Class 分布</h2>
+        <p class="chart-sub">细分类占比 · permission / quota_free / rate_limit …</p>
+        <div class="chart-body"><div id="pieClass" class="pie empty">无数据</div><div id="legendClass" class="legend"></div></div>
+      </div>
+    </section>
+    <p id="quotaNote" class="quota-note">用量观测：未连接 grok-quota 状态文件</p>
 
     <section class="toolbar">
       <div class="toolbar-row">
@@ -520,7 +680,7 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态</th><th>Class</th><th>原因</th><th>Management API</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态</th><th>Class</th><th>24h用量</th><th>原因</th><th>Management API</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
@@ -542,8 +702,17 @@ func statusPage() string {
     function reasonLabel(reason){return {payment_required:'无额度或无订阅',forbidden:'上游拒绝访问',unauthorized:'凭据未授权',rate_limited:'请求频率受限',rate_limited_fallback:'限流（默认冷却）'}[reason]||reason}
     function managementState(ban){if(ban.last_error)return {label:ban.management_disabled?'恢复重试中':'停用重试中',className:'management-error',title:ban.last_error};if(ban.management_disabled)return {label:Number(ban.remaining_seconds)>0?'已停用':'恢复中',className:Number(ban.remaining_seconds)>0?'management-ok':'management-pending',title:''};return {label:'等待停用',className:'management-pending',title:''}}
 
-    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
-    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.deletable?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
+    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
+
+    const STATUS_COLORS={'401':'#1570ef','402':'#f79009','403':'#d92d20','429':'#7f56d9'};
+    const CLASS_COLORS={auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
+    function colorForStatus(key){return STATUS_COLORS[String(key)]||'#98a2b3'}
+    function colorForClass(key){return CLASS_COLORS[key]||'#98a2b3'}
+    function formatTokens(ban){if(!ban)return '—';if(!ban.tokens_24h){return ban.quota_health?String(ban.quota_health):'—'}const m=(Number(ban.tokens_24h)/1e6).toFixed(2);let s=m+'M';if(ban.quota_limit)s+=' / '+(Number(ban.quota_limit)/1e6).toFixed(2)+'M';if(ban.over_reference)s+=' ↑';return s}
+    function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭 join-quota-state';return}if(q.ok){el.className='quota-note ok';el.textContent='用量观测：已连接 '+(q.path||'grok-quota-state')+' · 命中 '+Number(q.matched||0)+' 条（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'缺少 grok-quota-state.json')+'）。可并排安装 grok-quota 或配置 quota-state-file'}
+    function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
+    function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass)}
+    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.deletable?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
     function changePage(delta){state.page+=delta;render();document.querySelector('.table-wrap').scrollTop=0}
     async function runAction(params,question,successText){if(question&&!confirm(question))return;try{setMessage('正在执行操作...');const result=await api('/action?'+new URLSearchParams(params));state.selected.clear();const done=successText?successText(result):('操作完成，已解禁 '+(result.removed||0)+' 个凭据');setMessage(done);await loadData(true)}catch(error){setMessage(error.message,true)}}
     function unbanOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'unban',auth_id:id},'确认解禁该凭据？\n'+id)}

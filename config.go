@@ -34,6 +34,11 @@ type runtimeConfig struct {
 	AuthFailureCooldown time.Duration
 	StateFile           string
 	ClassifyBody        bool
+	// QuotaStateFile is optional path to grok-quota-state.json (or compatible).
+	// Empty = auto-detect common CPA paths / env GROK_QUOTA_STATE_PATH.
+	QuotaStateFile string
+	// JoinQuotaState attaches rolling 24h usage onto ban rows when state is present.
+	JoinQuotaState bool
 	// ClassDisableHours maps failure class → isolation duration.
 	// Missing classes fall back to DisableDuration.
 	ClassDisableHours map[string]time.Duration
@@ -53,6 +58,8 @@ type rawRuntimeConfig struct {
 	AuthFailureCooldownSeconds int                `yaml:"auth-failure-cooldown-seconds"`
 	StateFile                  string             `yaml:"state-file"`
 	ClassifyBody               *bool              `yaml:"classify-body"`
+	QuotaStateFile             string             `yaml:"quota-state-file"`
+	JoinQuotaState             *bool              `yaml:"join-quota-state"`
 	ClassDisableHours          map[string]float64 `yaml:"class-disable-hours"`
 	DeletableClasses           []string           `yaml:"deletable-classes"`
 }
@@ -69,6 +76,7 @@ func defaultRuntimeConfig() runtimeConfig {
 		AuthFailureCooldown: defaultAuthFailureCooldown,
 		StateFile:           defaultStateFile,
 		ClassifyBody:        true,
+		JoinQuotaState:      true,
 		// Defaults: all tracked failures isolate 24h (free 429 window / auth recovery window).
 		ClassDisableHours: defaultClassDisableHours(defaultDisableHours * time.Hour),
 		// Permanent delete only for hard permission denials by default; more classes can be enabled.
@@ -139,6 +147,12 @@ func parseRuntimeConfig(raw []byte) (runtimeConfig, error) {
 	}
 	if input.ClassifyBody != nil {
 		cfg.ClassifyBody = *input.ClassifyBody
+	}
+	if value := strings.TrimSpace(input.QuotaStateFile); value != "" {
+		cfg.QuotaStateFile = filepath.Clean(value)
+	}
+	if input.JoinQuotaState != nil {
+		cfg.JoinQuotaState = *input.JoinQuotaState
 	}
 	if len(input.ClassDisableHours) > 0 {
 		merged := defaultClassDisableHours(cfg.DisableDuration)

@@ -28,7 +28,8 @@ type classification struct {
 }
 
 // classifyFailure maps HTTP status + response body to a stable failure class.
-// Body matching is case-insensitive substring; more specific 403 rules win over unknown.
+// Keyword policy is aligned with grok-quota's isQuotaExhaustionFailure:
+// quota codes (free-usage / spending-limit) vs permission / plain rate-limit.
 func classifyFailure(status int, body string, classifyBody bool) classification {
 	text := strings.ToLower(strings.TrimSpace(body))
 	fp := bodyFingerprint(text)
@@ -41,21 +42,57 @@ func classifyFailure(status int, body string, classifyBody bool) classification 
 		}
 	}
 
-	// Paid spending-limit signals can appear on 402 or 403.
-	if status == 402 || status == 403 {
-		if containsAny(text,
-			"personal-team-blocked:spending-limit",
-			"spending-limit",
-		) {
-			return classification{Class: classQuotaPaid, Reason: "quota_paid", Fingerprint: fp}
+	// Non-quota denials first (permission / capacity / bad key).
+	if containsAny(text,
+		"access to the chat endpoint is denied",
+		"permission-denied",
+		"permission_denied",
+		"permission denied",
+		"deactivated_workspace",
+		"service capacity",
+		"overloaded",
+	) || strings.Trim(text, " .!\t\r\n") == "access denied" {
+		if status == 401 {
+			return classification{Class: classAuth, Reason: "unauthorized", Fingerprint: fp}
 		}
+		return classification{Class: classPermission, Reason: "permission_denied", Fingerprint: fp}
+	}
+
+	// Paid spending-limit / free-usage (402/403/429 as in grok-quota).
+	if containsAny(text,
+		"personal-team-blocked:spending-limit",
+		"spending-limit",
+		"out of credits",
+		"insufficient credits",
+		"quota exceeded",
+		"quota_exceeded",
+		"resource_exhausted",
+		"resource exhausted",
+	) {
+		return classification{Class: classQuotaPaid, Reason: "quota_paid", Fingerprint: fp}
+	}
+	if containsAny(text,
+		"subscription:free-usage-exhausted",
+		"free-usage-exhausted",
+		"used all the included free usage",
+		"included free usage for model",
+	) {
+		return classification{Class: classQuotaFree, Reason: "quota_free", Fingerprint: fp}
 	}
 
 	if status == 402 {
+		if containsAny(text, "credit", "spending", "quota", "billing", "payment") {
+			return classification{Class: classPayment, Reason: "payment_required", Fingerprint: fp}
+		}
 		return classification{Class: classPayment, Reason: "payment_required", Fingerprint: fp}
 	}
 
+	// Plain rate-limit without usage markers → rate_limit (not free quota).
 	if status == 429 {
+		if containsAny(text, "free-usage", "usage-exhausted", "spending-limit") {
+			// 429 carrying free-usage markers still treated as free window exhaust.
+			return classification{Class: classQuotaFree, Reason: "quota_free", Fingerprint: fp}
+		}
 		return classification{Class: classRateLimit, Reason: "rate_limited", Fingerprint: fp}
 	}
 
@@ -65,28 +102,13 @@ func classifyFailure(status int, body string, classifyBody bool) classification 
 
 	if status == 403 {
 		if containsAny(text,
-			"subscription:free-usage-exhausted",
-			"free-usage-exhausted",
-			"used all the included free usage",
-			"included free usage for model",
-		) {
-			return classification{Class: classQuotaFree, Reason: "quota_free", Fingerprint: fp}
-		}
-		if containsAny(text,
-			"access to the chat endpoint is denied",
-			"permission-denied",
-			"permission_denied",
-			"permission denied",
-		) || strings.Trim(text, " .!\t\r\n") == "access denied" {
-			return classification{Class: classPermission, Reason: "permission_denied", Fingerprint: fp}
-		}
-		if containsAny(text,
 			"invalid token",
 			"token expired",
 			"token_expired",
 			"unauthorized",
 			"authentication",
 			"unauthenticated",
+			"invalid api key",
 		) {
 			return classification{Class: classAuth, Reason: "auth_forbidden", Fingerprint: fp}
 		}

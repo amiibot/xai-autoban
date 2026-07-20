@@ -43,6 +43,14 @@ plugins:
 - 面板支持按 Class 展示；永久删除仅 `deletable-classes`（默认只有 `permission`），也可多选 class 批量删除。
 - 插件 id / 文件名仍为 `xai-autoban`，与 CPA 原安装路径兼容。
 
+### 用量观测与圆饼图（v1.2）
+
+- **不预 ban**：不会因为用量高或 grok-quota 标记而自动隔离。
+- 若存在 `plugins/grok-quota-state.json`（或配置 `quota-state-file` / 环境变量 `GROK_QUOTA_STATE_PATH`），面板为**已隔离**行附加只读 `tokens_24h`。
+- 观测页展示两个圆饼图：当前隔离池的 **HTTP 状态码占比** 与 **失败 Class 占比**。
+- 推荐与 [grok-quota](https://github.com/gzy3894-png/grok-quota) **并排安装**；本插件只读其状态文件。
+
+
 - 只处理 `xai` provider，不影响 Codex、Claude、Gemini 等其他凭据。
 - 错误发生后立即在 CPA 调度阶段跳过该凭据，后台再调用网页 Management API 真正停用账号。
 - 24 小时到期后调用 Management API 重新启用账号；失败时自动重试。
