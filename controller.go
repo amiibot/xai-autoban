@@ -75,6 +75,14 @@ func (c *autobanController) status() controllerStatus {
 	return controllerStatus{ManagementURL: c.cfg.ManagementURL, LastError: c.lastError, BlockedUntil: c.blockedUntil}
 }
 
+// clientSnapshot returns the Management API client for read-only list operations
+// (e.g. pie chart pool size). May be nil if not configured.
+func (c *autobanController) clientSnapshot() *managementClient {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.client
+}
+
 func (c *autobanController) handleUsage(record pluginapi.UsageRecord) {
 	cfg := c.config()
 	if !cfg.Enabled || !record.Failed || record.AuthID == "" || !cfg.handlesStatus(record.Failure.StatusCode) {

@@ -143,3 +143,11 @@ func (idx quotaJoinIndex) lookup(authID, authIndex, email string) (quotaAccountV
 	}
 	return quotaAccountView{}, false
 }
+
+// accountCount is the unique account base used for pie "normal" estimation.
+func (idx quotaJoinIndex) accountCount() int {
+	if len(idx.ByIndex) > 0 {
+		return len(idx.ByIndex)
+	}
+	return len(idx.ByEmail)
+}

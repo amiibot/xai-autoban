@@ -60,3 +60,21 @@ func TestBuildChartsSkipZeros(t *testing.T) {
 		t.Fatalf("class slices: %#v", byClass)
 	}
 }
+
+
+func TestEstimatePoolBannedOnlyWhenNoSources(t *testing.T) {
+	snapshot := map[string]banEntry{"a": {StatusCode: 403, Class: classPermission}}
+	banned := map[string]struct{}{"a": {}}
+	total, normal, disabled, source := estimatePool(defaultRuntimeConfig(), snapshot, banned, quotaJoinIndex{})
+	if source != "banned_only" || total != 1 || normal != 0 || disabled != 0 {
+		t.Fatalf("got total=%d normal=%d disabled=%d source=%s", total, normal, disabled, source)
+	}
+}
+
+func TestPrependOKSlice(t *testing.T) {
+	base := buildStatusChart(map[int]int{403: 2})
+	out := prependChartSlice(base, chartSlice{Key: chartKeyOK, Label: "正常", Count: 5})
+	if len(out) != 2 || out[0].Key != chartKeyOK || out[0].Count != 5 {
+		t.Fatalf("%#v", out)
+	}
+}

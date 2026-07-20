@@ -23,6 +23,7 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -40,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.2.0"
+	pluginVersion = "1.2.1"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -406,6 +407,10 @@ type statusInfo struct {
 	Plugin           string               `json:"plugin"`
 	Version          string               `json:"version"`
 	Count            int                  `json:"count"`
+	// PoolTotal is xAI credentials known to the pie (banned + normal when available).
+	PoolTotal int `json:"pool_total"`
+	// NormalCount is currently not banned (and not disabled, when known).
+	NormalCount      int                  `json:"normal_count"`
 	DeletableClasses []string             `json:"deletable_classes"`
 	Charts           chartBundle          `json:"charts"`
 	QuotaJoin        quotaJoinInfo        `json:"quota_join"`
@@ -416,6 +421,9 @@ type statusInfo struct {
 type chartBundle struct {
 	ByStatus []chartSlice `json:"by_status"`
 	ByClass  []chartSlice `json:"by_class"`
+	// IncludesNormal documents whether "ok/normal" slices were estimated from pool.
+	IncludesNormal bool   `json:"includes_normal"`
+	PoolSource     string `json:"pool_source,omitempty"` // management | quota_state | banned_only
 }
 
 type chartSlice struct {
@@ -431,6 +439,8 @@ type quotaJoinInfo struct {
 	Error   string `json:"error,omitempty"`
 	// Matched is how many ban rows found a quota record.
 	Matched int `json:"matched"`
+	// PoolAccounts is number of accounts in the quota state file (for pie base).
+	PoolAccounts int `json:"pool_accounts,omitempty"`
 }
 
 type managementStatusInfo struct {
@@ -460,6 +470,13 @@ type banInfo struct {
 	OverRef     bool   `json:"over_reference,omitempty"`
 }
 
+const (
+	// chart keys for non-HTTP / healthy accounts
+	chartKeyOK      = "ok"
+	chartKeyDisabled = "disabled"
+	classOK          = "ok"
+)
+
 func currentStatus() statusInfo {
 	now := time.Now()
 	snapshot := bans.snapshot(now)
@@ -472,12 +489,14 @@ func currentStatus() statusInfo {
 		qinfo.OK = qidx.OK
 		qinfo.Path = qidx.Path
 		qinfo.Error = qidx.Error
+		qinfo.PoolAccounts = qidx.accountCount()
 	}
 
 	statusCounts := map[int]int{}
 	classCounts := map[string]int{}
 	items := make([]banInfo, 0, len(snapshot))
 	matched := 0
+	bannedKeys := map[string]struct{}{}
 	for id, entry := range snapshot {
 		remaining := int64(entry.ResetAt.Sub(now).Seconds())
 		if remaining < 0 {
@@ -489,6 +508,10 @@ func currentStatus() statusInfo {
 		}
 		statusCounts[entry.StatusCode]++
 		classCounts[class]++
+		bannedKeys[id] = struct{}{}
+		if entry.AuthIndex != "" {
+			bannedKeys[entry.AuthIndex] = struct{}{}
+		}
 		info := banInfo{
 			AuthID: id, AuthIndex: entry.AuthIndex, StatusCode: entry.StatusCode, Class: class, Reason: entry.Reason,
 			BodyFingerprint: entry.BodyFingerprint, BannedAt: entry.BannedAt.Format(time.RFC3339),
@@ -513,9 +536,26 @@ func currentStatus() statusInfo {
 	qinfo.Matched = matched
 	sort.Slice(items, func(i, j int) bool { return items[i].ResetAt < items[j].ResetAt })
 
+	// Pool size + normal accounts for pies (observe only).
+	poolTotal, normalCount, disabledCount, poolSource := estimatePool(cfg, snapshot, bannedKeys, qidx)
+
+	// Inject "ok" / disabled into charts when we know the pool.
+	statusSlices := buildStatusChart(statusCounts)
+	classSlices := buildClassChart(classCounts)
+	if poolTotal > len(items) || normalCount > 0 {
+		if normalCount > 0 {
+			statusSlices = prependChartSlice(statusSlices, chartSlice{Key: chartKeyOK, Label: "正常", Count: normalCount})
+			classSlices = prependChartSlice(classSlices, chartSlice{Key: classOK, Label: "正常", Count: normalCount})
+		}
+		if disabledCount > 0 {
+			statusSlices = append(statusSlices, chartSlice{Key: chartKeyDisabled, Label: "已禁用(非隔离)", Count: disabledCount})
+		}
+	}
 	charts := chartBundle{
-		ByStatus: buildStatusChart(statusCounts),
-		ByClass:  buildClassChart(classCounts),
+		ByStatus:       statusSlices,
+		ByClass:        classSlices,
+		IncludesNormal: normalCount > 0 || poolSource != "banned_only",
+		PoolSource:     poolSource,
 	}
 
 	controller := autoban.status()
@@ -523,11 +563,82 @@ func currentStatus() statusInfo {
 	if !controller.BlockedUntil.IsZero() {
 		management.BlockedUntil = controller.BlockedUntil.Format(time.RFC3339)
 	}
+	if poolTotal < len(items) {
+		poolTotal = len(items)
+	}
 	return statusInfo{
 		Plugin: pluginName, Version: pluginVersion, Count: len(items),
+		PoolTotal: poolTotal, NormalCount: normalCount,
 		DeletableClasses: cfg.deletableClassList(), Charts: charts, QuotaJoin: qinfo,
 		Management: management, Bans: items,
 	}
+}
+
+// estimatePool returns total xAI credentials, normal (enabled & not banned), and
+// disabled-but-not-banned counts for pie charts. Prefer Management API list;
+// fall back to grok-quota state size; else banned-only.
+func estimatePool(cfg runtimeConfig, snapshot map[string]banEntry, bannedKeys map[string]struct{}, qidx quotaJoinIndex) (poolTotal, normal, disabledExtra int, source string) {
+	bannedN := len(snapshot)
+	// 1) Management API — authoritative pool of xAI auth files.
+	client := autoban.clientSnapshot()
+	if client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		files, err := client.listXAIAuthFiles(ctx)
+		cancel()
+		if err == nil && len(files) > 0 {
+			source = "management"
+			poolTotal = len(files)
+			for _, f := range files {
+				if isBannedAuth(bannedKeys, f.ID, f.AuthIndex) {
+					continue
+				}
+				if f.Disabled {
+					disabledExtra++
+					continue
+				}
+				normal++
+			}
+			return poolTotal, normal, disabledExtra, source
+		}
+	}
+	// 2) Quota state account count (observation pool).
+	if qidx.OK {
+		n := qidx.accountCount()
+		if n > 0 {
+			source = "quota_state"
+			poolTotal = n
+			// Normal ≈ pool - currently banned (cannot know disabled without management).
+			normal = n - bannedN
+			if normal < 0 {
+				normal = 0
+			}
+			return poolTotal, normal, 0, source
+		}
+	}
+	// 3) Banned only — pie has no "ok" slice.
+	return bannedN, 0, 0, "banned_only"
+}
+
+func isBannedAuth(bannedKeys map[string]struct{}, id, authIndex string) bool {
+	if _, ok := bannedKeys[strings.TrimSpace(id)]; ok {
+		return true
+	}
+	if authIndex != "" {
+		if _, ok := bannedKeys[strings.TrimSpace(authIndex)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func prependChartSlice(slices []chartSlice, head chartSlice) []chartSlice {
+	if head.Count <= 0 {
+		return slices
+	}
+	out := make([]chartSlice, 0, len(slices)+1)
+	out = append(out, head)
+	out = append(out, slices...)
+	return out
 }
 
 func buildStatusChart(counts map[int]int) []chartSlice {
@@ -634,6 +745,8 @@ func statusPage() string {
   <main>
     <section class="stats" aria-label="隔离统计">
       <div class="stat stat-total"><div class="stat-label">当前隔离</div><div class="stat-value" id="total">-</div></div>
+      <div class="stat stat-total" style="border-left-color:#12b76a"><div class="stat-label">正常(估)</div><div class="stat-value" id="normalCount">-</div></div>
+      <div class="stat stat-total" style="border-left-color:#667085"><div class="stat-label">池规模</div><div class="stat-value" id="poolTotal">-</div></div>
       <div class="stat stat-401"><div class="stat-label">401 未授权</div><div class="stat-value" id="count401">-</div></div>
       <div class="stat stat-402"><div class="stat-label">402 无额度</div><div class="stat-value" id="count402">-</div></div>
       <div class="stat stat-403"><div class="stat-label">403 禁止访问</div><div class="stat-value" id="count403">-</div></div>
@@ -642,12 +755,12 @@ func statusPage() string {
     <section class="charts" aria-label="status charts">
       <div class="chart-card">
         <h2>HTTP 状态分布</h2>
-        <p class="chart-sub">当前隔离账号的上游状态码占比（仅观测）</p>
+        <p class="chart-sub">账号池占比：正常 + 401/402/403/429（能拿到池规模时含正常号）</p>
         <div class="chart-body"><div id="pieStatus" class="pie empty">无数据</div><div id="legendStatus" class="legend"></div></div>
       </div>
       <div class="chart-card">
         <h2>失败 Class 分布</h2>
-        <p class="chart-sub">细分类占比 · permission / quota_free / rate_limit …</p>
+        <p class="chart-sub">账号池占比：正常 + 细分类（permission / quota_free / …）</p>
         <div class="chart-body"><div id="pieClass" class="pie empty">无数据</div><div id="legendClass" class="legend"></div></div>
       </div>
     </section>
@@ -702,16 +815,16 @@ func statusPage() string {
     function reasonLabel(reason){return {payment_required:'无额度或无订阅',forbidden:'上游拒绝访问',unauthorized:'凭据未授权',rate_limited:'请求频率受限',rate_limited_fallback:'限流（默认冷却）'}[reason]||reason}
     function managementState(ban){if(ban.last_error)return {label:ban.management_disabled?'恢复重试中':'停用重试中',className:'management-error',title:ban.last_error};if(ban.management_disabled)return {label:Number(ban.remaining_seconds)>0?'已停用':'恢复中',className:Number(ban.remaining_seconds)>0?'management-ok':'management-pending',title:''};return {label:'等待停用',className:'management-pending',title:''}}
 
-    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
+    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
 
-    const STATUS_COLORS={'401':'#1570ef','402':'#f79009','403':'#d92d20','429':'#7f56d9'};
-    const CLASS_COLORS={auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
+    const STATUS_COLORS={'ok':'#12b76a','disabled':'#98a2b3','401':'#1570ef','402':'#f79009','403':'#d92d20','429':'#7f56d9'};
+    const CLASS_COLORS={ok:'#12b76a',auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
     function colorForStatus(key){return STATUS_COLORS[String(key)]||'#98a2b3'}
     function colorForClass(key){return CLASS_COLORS[key]||'#98a2b3'}
     function formatTokens(ban){if(!ban)return '—';if(!ban.tokens_24h){return ban.quota_health?String(ban.quota_health):'—'}const m=(Number(ban.tokens_24h)/1e6).toFixed(2);let s=m+'M';if(ban.quota_limit)s+=' / '+(Number(ban.quota_limit)/1e6).toFixed(2)+'M';if(ban.over_reference)s+=' ↑';return s}
-    function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭 join-quota-state';return}if(q.ok){el.className='quota-note ok';el.textContent='用量观测：已连接 '+(q.path||'grok-quota-state')+' · 命中 '+Number(q.matched||0)+' 条（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'缺少 grok-quota-state.json')+'）。可并排安装 grok-quota 或配置 quota-state-file'}
+    function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭 join-quota-state';return}if(q.ok){el.className='quota-note ok';el.textContent='用量观测：已连接 '+(q.path||'grok-quota-state')+' · 命中 '+Number(q.matched||0)+' 条 · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'缺少 grok-quota-state.json')+'）。可并排安装 grok-quota 或配置 quota-state-file'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
-    function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass)}
+    function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
     function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.deletable?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
     function changePage(delta){state.page+=delta;render();document.querySelector('.table-wrap').scrollTop=0}
     async function runAction(params,question,successText){if(question&&!confirm(question))return;try{setMessage('正在执行操作...');const result=await api('/action?'+new URLSearchParams(params));state.selected.clear();const done=successText?successText(result):('操作完成，已解禁 '+(result.removed||0)+' 个凭据');setMessage(done);await loadData(true)}catch(error){setMessage(error.message,true)}}

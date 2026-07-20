@@ -111,29 +111,54 @@ func (c *managementClient) patchAuthStatus(ctx context.Context, name string, dis
 	return nil
 }
 
-func (c *managementClient) findAuthFile(ctx context.Context, authID, authIndex string) (managementAuthFile, bool, error) {
+func (c *managementClient) listAuthFiles(ctx context.Context) ([]managementAuthFile, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/auth-files", nil)
 	if err != nil {
-		return managementAuthFile{}, false, err
+		return nil, err
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return managementAuthFile{}, false, fmt.Errorf("查询 Management API 账号列表失败: %w", err)
+		return nil, fmt.Errorf("查询 Management API 账号列表失败: %w", err)
 	}
 	defer resp.Body.Close()
 	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return managementAuthFile{}, false, &managementHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(responseBody))}
+		return nil, &managementHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(responseBody))}
 	}
 	var payload struct {
 		Files []managementAuthFile `json:"files"`
 	}
 	if err := json.Unmarshal(responseBody, &payload); err != nil {
-		return managementAuthFile{}, false, fmt.Errorf("解析 Management API 账号列表失败: %w", err)
+		return nil, fmt.Errorf("解析 Management API 账号列表失败: %w", err)
+	}
+	return payload.Files, nil
+}
+
+// listXAIAuthFiles returns xAI provider credentials from Management API.
+func (c *managementClient) listXAIAuthFiles(ctx context.Context) ([]managementAuthFile, error) {
+	files, err := c.listAuthFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]managementAuthFile, 0, len(files))
+	for _, file := range files {
+		provider := strings.ToLower(strings.TrimSpace(file.Provider))
+		typ := strings.ToLower(strings.TrimSpace(file.Type))
+		if provider == "xai" || typ == "xai" || strings.Contains(strings.ToLower(file.Name), "xai") {
+			out = append(out, file)
+		}
+	}
+	return out, nil
+}
+
+func (c *managementClient) findAuthFile(ctx context.Context, authID, authIndex string) (managementAuthFile, bool, error) {
+	files, err := c.listAuthFiles(ctx)
+	if err != nil {
+		return managementAuthFile{}, false, err
 	}
 	authID = strings.TrimSpace(authID)
 	authIndex = strings.TrimSpace(authIndex)
-	for _, file := range payload.Files {
+	for _, file := range files {
 		if strings.TrimSpace(file.ID) == authID || (authIndex != "" && strings.TrimSpace(file.AuthIndex) == authIndex) {
 			return file, true, nil
 		}
