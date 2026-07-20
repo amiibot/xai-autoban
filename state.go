@@ -16,7 +16,9 @@ const stateSchemaVersion = 1
 type banEntry struct {
 	AuthIndex          string    `json:"auth_index,omitempty"`
 	StatusCode         int       `json:"status_code"`
+	Class              string    `json:"class,omitempty"`
 	Reason             string    `json:"reason"`
+	BodyFingerprint    string    `json:"body_fingerprint,omitempty"`
 	BannedAt           time.Time `json:"banned_at"`
 	ResetAt            time.Time `json:"reset_at"`
 	ManagementDisabled bool      `json:"management_disabled"`
@@ -313,6 +315,52 @@ func (s *banState) authIDsByStatus(status int) []string {
 	out := make([]string, 0)
 	for authID, entry := range s.bans {
 		if entry.StatusCode == status {
+			out = append(out, authID)
+		}
+	}
+	return out
+}
+
+func (s *banState) authIDsByClass(class string) []string {
+	class = strings.TrimSpace(class)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0)
+	for authID, entry := range s.bans {
+		entryClass := entry.Class
+		if entryClass == "" {
+			entryClass = classLegacy
+		}
+		if entryClass == class {
+			out = append(out, authID)
+		}
+	}
+	return out
+}
+
+func (s *banState) authIDsByClasses(classes []string) []string {
+	if len(classes) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(classes))
+	for _, class := range classes {
+		class = strings.TrimSpace(class)
+		if class != "" {
+			want[class] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0)
+	for authID, entry := range s.bans {
+		entryClass := entry.Class
+		if entryClass == "" {
+			entryClass = classLegacy
+		}
+		if _, ok := want[entryClass]; ok {
 			out = append(out, authID)
 		}
 	}

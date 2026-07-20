@@ -33,19 +33,28 @@ type runtimeConfig struct {
 	RetryInterval       time.Duration
 	AuthFailureCooldown time.Duration
 	StateFile           string
+	ClassifyBody        bool
+	// ClassDisableHours maps failure class → isolation duration.
+	// Missing classes fall back to DisableDuration.
+	ClassDisableHours map[string]time.Duration
+	// DeletableClasses are the only classes allowed for permanent Management delete.
+	DeletableClasses map[string]struct{}
 }
 
 type rawRuntimeConfig struct {
-	Enabled                    *bool  `yaml:"enabled"`
-	ManagementURL              string `yaml:"management-url"`
-	ManagementKey              string `yaml:"management-key"`
-	ManagementKeyEnv           string `yaml:"management-key-env"`
-	DisableHours               int    `yaml:"disable-hours"`
-	StatusCodes                []int  `yaml:"status-codes"`
-	RequestTimeoutSeconds      int    `yaml:"request-timeout-seconds"`
-	RetryIntervalSeconds       int    `yaml:"retry-interval-seconds"`
-	AuthFailureCooldownSeconds int    `yaml:"auth-failure-cooldown-seconds"`
-	StateFile                  string `yaml:"state-file"`
+	Enabled                    *bool              `yaml:"enabled"`
+	ManagementURL              string             `yaml:"management-url"`
+	ManagementKey              string             `yaml:"management-key"`
+	ManagementKeyEnv           string             `yaml:"management-key-env"`
+	DisableHours               int                `yaml:"disable-hours"`
+	StatusCodes                []int              `yaml:"status-codes"`
+	RequestTimeoutSeconds      int                `yaml:"request-timeout-seconds"`
+	RetryIntervalSeconds       int                `yaml:"retry-interval-seconds"`
+	AuthFailureCooldownSeconds int                `yaml:"auth-failure-cooldown-seconds"`
+	StateFile                  string             `yaml:"state-file"`
+	ClassifyBody               *bool              `yaml:"classify-body"`
+	ClassDisableHours          map[string]float64 `yaml:"class-disable-hours"`
+	DeletableClasses           []string           `yaml:"deletable-classes"`
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -59,7 +68,29 @@ func defaultRuntimeConfig() runtimeConfig {
 		RetryInterval:       defaultRetryInterval,
 		AuthFailureCooldown: defaultAuthFailureCooldown,
 		StateFile:           defaultStateFile,
+		ClassifyBody:        true,
+		// Defaults: all tracked failures isolate 24h (free 429 window / auth recovery window).
+		ClassDisableHours: defaultClassDisableHours(defaultDisableHours * time.Hour),
+		// Permanent delete only for hard permission denials by default; more classes can be enabled.
+		DeletableClasses: stringSet([]string{classPermission}),
 	}
+}
+
+func defaultClassDisableHours(fallback time.Duration) map[string]time.Duration {
+	out := make(map[string]time.Duration, 8)
+	for _, c := range []string{
+		classAuth,
+		classPayment,
+		classQuotaFree,
+		classQuotaPaid,
+		classPermission,
+		classRateLimit,
+		classForbiddenUnknown,
+		classOther,
+	} {
+		out[c] = fallback
+	}
+	return out
 }
 
 func parseRuntimeConfig(raw []byte) (runtimeConfig, error) {
@@ -88,6 +119,8 @@ func parseRuntimeConfig(raw []byte) (runtimeConfig, error) {
 	}
 	if input.DisableHours > 0 {
 		cfg.DisableDuration = time.Duration(input.DisableHours) * time.Hour
+		// When only disable-hours is set, keep all class defaults aligned unless overridden below.
+		cfg.ClassDisableHours = defaultClassDisableHours(cfg.DisableDuration)
 	}
 	if len(input.StatusCodes) > 0 {
 		cfg.StatusCodes = statusCodeSet(input.StatusCodes)
@@ -103,6 +136,24 @@ func parseRuntimeConfig(raw []byte) (runtimeConfig, error) {
 	}
 	if value := strings.TrimSpace(input.StateFile); value != "" {
 		cfg.StateFile = filepath.Clean(value)
+	}
+	if input.ClassifyBody != nil {
+		cfg.ClassifyBody = *input.ClassifyBody
+	}
+	if len(input.ClassDisableHours) > 0 {
+		merged := defaultClassDisableHours(cfg.DisableDuration)
+		for class, hours := range input.ClassDisableHours {
+			class = strings.TrimSpace(strings.ToLower(class))
+			if class == "" || hours <= 0 {
+				continue
+			}
+			merged[class] = time.Duration(hours * float64(time.Hour))
+		}
+		cfg.ClassDisableHours = merged
+	}
+	if input.DeletableClasses != nil {
+		// Explicit empty list means nothing is permanently deletable.
+		cfg.DeletableClasses = stringSet(input.DeletableClasses)
 	}
 	return cfg, nil
 }
@@ -131,12 +182,59 @@ func (c runtimeConfig) statusCodeList() []int {
 	return out
 }
 
+func (c runtimeConfig) durationForClass(class string) time.Duration {
+	class = strings.TrimSpace(class)
+	if class != "" && c.ClassDisableHours != nil {
+		if d, ok := c.ClassDisableHours[class]; ok && d > 0 {
+			return d
+		}
+	}
+	if c.DisableDuration > 0 {
+		return c.DisableDuration
+	}
+	return defaultDisableHours * time.Hour
+}
+
+func (c runtimeConfig) classDeletable(class string) bool {
+	if len(c.DeletableClasses) == 0 {
+		return false
+	}
+	class = strings.TrimSpace(class)
+	if class == "" {
+		_, ok := c.DeletableClasses[classLegacy]
+		return ok
+	}
+	_, ok := c.DeletableClasses[class]
+	return ok
+}
+
+func (c runtimeConfig) deletableClassList() []string {
+	out := make([]string, 0, len(c.DeletableClasses))
+	for class := range c.DeletableClasses {
+		out = append(out, class)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func statusCodeSet(statuses []int) map[int]struct{} {
 	out := make(map[int]struct{}, len(statuses))
 	for _, status := range statuses {
 		if status >= 100 && status <= 599 {
 			out[status] = struct{}{}
 		}
+	}
+	return out
+}
+
+func stringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(strings.ToLower(value))
+		if value == "" {
+			continue
+		}
+		out[value] = struct{}{}
 	}
 	return out
 }

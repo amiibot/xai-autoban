@@ -57,13 +57,13 @@ func TestPublicStatusPageHasNoManagementAuthentication(t *testing.T) {
 			t.Fatalf("page still contains authenticated management flow: %q", forbidden)
 		}
 	}
-	for _, required := range []string{"window.location.pathname", "unbanSelected", "unbanStatus", "autoRefresh", "deleteOne", "deleteAll403", "data-delete"} {
+	for _, required := range []string{"window.location.pathname", "unbanSelected", "unbanStatus", "autoRefresh", "deleteOne", "deleteDeletableClasses", "data-delete"} {
 		if !strings.Contains(page, required) {
 			t.Fatalf("page is missing %q", required)
 		}
 	}
-	if !strings.Contains(page, "删除账号") || !strings.Contains(page, "删除全部 403") {
-		t.Fatal("page is missing 403 permanent delete controls")
+	if !strings.Contains(page, "删除账号") || !strings.Contains(page, "删除全部可删 class") {
+		t.Fatal("page is missing permanent delete controls")
 	}
 }
 
@@ -276,8 +276,9 @@ func TestStateReloadKeepsPendingReenable(t *testing.T) {
 func TestPublicDeleteOnlyAllows403(t *testing.T) {
 	bans.clearAll()
 	now := time.Now()
-	bans.set("payment", banEntry{StatusCode: 402, AuthIndex: "idx-402", ResetAt: now.Add(time.Hour)})
-	bans.set("forbidden", banEntry{StatusCode: 403, AuthIndex: "idx-403", ResetAt: now.Add(time.Hour)})
+	bans.set("payment", banEntry{StatusCode: 402, Class: classPayment, AuthIndex: "idx-402", ResetAt: now.Add(time.Hour)})
+	bans.set("forbidden", banEntry{StatusCode: 403, Class: classPermission, AuthIndex: "idx-403", ResetAt: now.Add(time.Hour)})
+	bans.set("quota", banEntry{StatusCode: 403, Class: classQuotaFree, AuthIndex: "idx-quota", ResetAt: now.Add(time.Hour)})
 
 	var deletedNames []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -293,7 +294,8 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
 			_, _ = w.Write([]byte(`{"files":[
 				{"id":"payment","auth_index":"idx-402","name":"payment.json","provider":"xai","disabled":true},
-				{"id":"forbidden","auth_index":"idx-403","name":"forbidden.json","provider":"xai","disabled":true}
+				{"id":"forbidden","auth_index":"idx-403","name":"forbidden.json","provider":"xai","disabled":true},
+				{"id":"quota","auth_index":"idx-quota","name":"quota.json","provider":"xai","disabled":true}
 			]}`))
 		default:
 			http.NotFound(w, r)
@@ -309,13 +311,21 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 	}
 	autoban = controller
 
-	// 402 should not be deleted by 403-only delete path.
-	deleted, err := controller.deleteCredentials([]string{"payment"}, 403)
+	// payment (402) not deletable by class gate.
+	deleted, err := controller.deleteCredentials([]string{"payment"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if deleted != 0 {
-		t.Fatalf("402 credential should not be deleted: %d", deleted)
+		t.Fatalf("payment credential should not be deleted: %d", deleted)
+	}
+	// quota_free 403 not deletable by default.
+	deleted, err = controller.deleteCredentials([]string{"quota"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 0 {
+		t.Fatalf("quota_free should not be deleted: %d", deleted)
 	}
 
 	response := publicAction(pluginapi.ManagementRequest{Query: url.Values{"op": {"delete"}, "auth_id": {"forbidden"}}})
@@ -323,8 +333,16 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", response.StatusCode, response.Body)
 	}
 	status := currentStatus()
-	if status.Count != 1 || status.Bans[0].AuthID != "payment" {
-		t.Fatalf("unexpected bans after delete: %#v", status)
+	// payment + quota remain; forbidden (permission) deleted
+	if status.Count != 2 {
+		t.Fatalf("unexpected bans after delete: count=%d %#v", status.Count, status)
+	}
+	ids := map[string]bool{}
+	for _, b := range status.Bans {
+		ids[b.AuthID] = true
+	}
+	if !ids["payment"] || !ids["quota"] || ids["forbidden"] {
+		t.Fatalf("unexpected bans after delete: %#v", status.Bans)
 	}
 	if len(deletedNames) == 0 {
 		t.Fatal("expected management delete call")
@@ -334,9 +352,10 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 func TestPublicDeleteAll403(t *testing.T) {
 	bans.clearAll()
 	now := time.Now()
-	bans.set("a", banEntry{StatusCode: 403, AuthIndex: "idx-a", ResetAt: now.Add(time.Hour)})
-	bans.set("b", banEntry{StatusCode: 403, AuthIndex: "idx-b", ResetAt: now.Add(time.Hour)})
-	bans.set("c", banEntry{StatusCode: 429, AuthIndex: "idx-c", ResetAt: now.Add(time.Hour)})
+	bans.set("a", banEntry{StatusCode: 403, Class: classPermission, AuthIndex: "idx-a", ResetAt: now.Add(time.Hour)})
+	bans.set("b", banEntry{StatusCode: 403, Class: classPermission, AuthIndex: "idx-b", ResetAt: now.Add(time.Hour)})
+	bans.set("c", banEntry{StatusCode: 429, Class: classRateLimit, AuthIndex: "idx-c", ResetAt: now.Add(time.Hour)})
+	bans.set("d", banEntry{StatusCode: 403, Class: classQuotaFree, AuthIndex: "idx-d", ResetAt: now.Add(time.Hour)})
 
 	deleteCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -353,7 +372,8 @@ func TestPublicDeleteAll403(t *testing.T) {
 			_, _ = w.Write([]byte(`{"files":[
 				{"id":"a","auth_index":"idx-a","name":"a.json","provider":"xai","disabled":true},
 				{"id":"b","auth_index":"idx-b","name":"b.json","provider":"xai","disabled":true},
-				{"id":"c","auth_index":"idx-c","name":"c.json","provider":"xai","disabled":true}
+				{"id":"c","auth_index":"idx-c","name":"c.json","provider":"xai","disabled":true},
+				{"id":"d","auth_index":"idx-d","name":"d.json","provider":"xai","disabled":true}
 			]}`))
 		default:
 			http.NotFound(w, r)
@@ -374,8 +394,16 @@ func TestPublicDeleteAll403(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", response.StatusCode, response.Body)
 	}
 	status := currentStatus()
-	if status.Count != 1 || status.Bans[0].StatusCode != 429 {
-		t.Fatalf("unexpected bans after delete-403: %#v", status)
+	// permission 403 deleted; rate_limit + quota_free remain
+	if status.Count != 2 {
+		t.Fatalf("unexpected bans after delete-403: count=%d %#v", status.Count, status)
+	}
+	classes := map[string]bool{}
+	for _, b := range status.Bans {
+		classes[b.Class] = true
+	}
+	if !classes[classRateLimit] || !classes[classQuotaFree] {
+		t.Fatalf("expected rate_limit and quota_free remaining: %#v", status.Bans)
 	}
 	if deleteCount < 2 {
 		t.Fatalf("expected at least 2 delete calls, got %d", deleteCount)

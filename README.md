@@ -9,7 +9,39 @@
 | `401` | 通过 Management API 停用 24 小时 |
 | `402` | 通过 Management API 停用 24 小时 |
 | `403` | 通过 Management API 停用 24 小时 |
-| `429` | 通过 Management API 停用 24 小时 |
+| `429` | 通过 Management API 停用 24 小时（默认；可用 class 覆盖） |
+
+### 细分类（v1.1，本 fork）
+
+失败时解析 `UsageFailure.Body`，将账号归入 class，并按 class 决定隔离时长与是否允许永久删除：
+
+| Class | 典型信号 | 默认隔离 | 默认可永久删除 |
+| --- | --- | --- | --- |
+| `auth` | 401；403 body 含 invalid/expired token | 24h | 否 |
+| `payment` | 402 | 24h | 否 |
+| `quota_paid` | spending-limit 等 | 24h | 否 |
+| `quota_free` | free-usage-exhausted 等 | 24h | 否 |
+| `permission` | permission-denied / chat endpoint denied | 24h | **是** |
+| `rate_limit` | 429 | 24h | 否 |
+| `forbidden_unknown` | 其它 403 | 24h | 否 |
+
+配置示例：
+
+```yaml
+plugins:
+  configs:
+    xai-autoban:
+      enabled: true
+      disable-hours: 24
+      classify-body: true
+      # class-disable-hours:
+      #   rate_limit: 24
+      #   permission: 48
+      deletable-classes: [permission]   # 可追加如 quota_free
+```
+
+- 面板支持按 Class 展示；永久删除仅 `deletable-classes`（默认只有 `permission`），也可多选 class 批量删除。
+- 插件 id / 文件名仍为 `xai-autoban`，与 CPA 原安装路径兼容。
 
 - 只处理 `xai` provider，不影响 Codex、Claude、Gemini 等其他凭据。
 - 错误发生后立即在 CPA 调度阶段跳过该凭据，后台再调用网页 Management API 真正停用账号。
@@ -19,7 +51,7 @@
 - 可通过 `status-codes` 自定义触发停用的 HTTP 状态码。
 - 提供实时统计、搜索、筛选、分页和批量解禁界面。
 - 支持单个、选中项、按状态码和全部解禁。
-- 支持对 `403` 账号一键永久删除（调用 Management API 删除凭据文件，不是解除禁用）。
+- 支持对 **可删 class**（默认 `permission`）永久删除；可配置 `deletable-classes` 勾选多种 class（调用 Management API 删除凭据文件，不是解除禁用）。
 - 保留带 CPA 管理密钥保护的 Management API。
 
 ## 构建
@@ -141,7 +173,7 @@ plugins:
 重启 CLIProxyAPI 后，日志应包含：
 
 ```text
-pluginhost: plugin registered plugin_id=xai-autoban plugin_name=xai-autoban version=1.0.4
+pluginhost: plugin registered plugin_id=xai-autoban plugin_name=xai-autoban version=1.1.0
 ```
 
 ## 管理面板
@@ -159,7 +191,7 @@ POST /v0/management/plugins/xai-autoban/import
 ## 状态说明
 
 - 插件只会自动恢复由自己成功停用并记录的账号。
-- `401`、`402`、`403`、`429` 默认统一在首次错误后 24 小时恢复，可通过 `disable-hours` 调整。
+- `401`、`402`、`403`、`429` 默认在首次错误后按 class 隔离 24 小时；可用 `disable-hours` / `class-disable-hours` 调整。
 - 凭据修复、充值或恢复订阅后，可从面板手动解禁，无需等待到期。
 - 插件仅处理已经被请求命中的错误凭据，不会主动扫描整个账号池。
 - 如果所有候选凭据都被插件隔离，最终行为交由 CPA 自带调度器决定。

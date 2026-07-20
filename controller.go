@@ -80,36 +80,31 @@ func (c *autobanController) handleUsage(record pluginapi.UsageRecord) {
 	if !cfg.Enabled || !record.Failed || record.AuthID == "" || !cfg.handlesStatus(record.Failure.StatusCode) {
 		return
 	}
+	// Only act on xAI provider records when provider is populated.
+	if record.Provider != "" && !strings.EqualFold(record.Provider, providerXAI) {
+		return
+	}
 	now := time.Now()
+	cls := classifyFailure(record.Failure.StatusCode, record.Failure.Body, cfg.ClassifyBody)
+	duration := cfg.durationForClass(cls.Class)
 	entry := banEntry{
-		AuthIndex:  record.AuthIndex,
-		StatusCode: record.Failure.StatusCode,
-		Reason:     failureReason(record.Failure.StatusCode),
-		BannedAt:   now,
-		ResetAt:    now.Add(cfg.DisableDuration),
+		AuthIndex:       record.AuthIndex,
+		StatusCode:      record.Failure.StatusCode,
+		Class:           cls.Class,
+		Reason:          cls.Reason,
+		BodyFingerprint: cls.Fingerprint,
+		BannedAt:        now,
+		ResetAt:         now.Add(duration),
 	}
 	c.state.set(record.AuthID, entry)
 	slog.Warn("xai-autoban: credential queued for management disable",
 		"auth_id", record.AuthID,
 		"status", entry.StatusCode,
+		"class", entry.Class,
+		"reason", entry.Reason,
 		"reset_at", entry.ResetAt.Format(time.RFC3339),
 	)
 	c.signal()
-}
-
-func failureReason(status int) string {
-	switch status {
-	case 401:
-		return "unauthorized"
-	case 402:
-		return "payment_required"
-	case 403:
-		return "forbidden"
-	case 429:
-		return "rate_limited"
-	default:
-		return fmt.Sprintf("http_%d", status)
-	}
 }
 
 func (c *autobanController) requestRelease(authIDs []string) int {
@@ -217,7 +212,7 @@ func (c *autobanController) process() {
 
 
 // deleteCredentials permanently removes auth files for the given IDs via Management API.
-// Only credentials currently tracked with statusCode are deleted when statusCode > 0.
+// Only credentials whose failure class is in deletable-classes are deleted.
 // Unlike release/unban, this does not re-enable the credential.
 func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) (int, error) {
 	ids := make([]string, 0, len(authIDs))
@@ -231,6 +226,7 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 		return 0, nil
 	}
 
+	cfg := c.config()
 	c.mu.RLock()
 	client := c.client
 	blockedUntil := c.blockedUntil
@@ -253,6 +249,13 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 		if statusCode > 0 && entry.StatusCode != statusCode {
 			continue
 		}
+		entryClass := entry.Class
+		if entryClass == "" {
+			entryClass = classLegacy
+		}
+		if !cfg.classDeletable(entryClass) {
+			continue
+		}
 		err := client.deleteAuthFile(context.Background(), id, entry.AuthIndex)
 		if err != nil {
 			if isManagementAuthError(err) {
@@ -273,7 +276,8 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 		}
 		_ = c.state.clear(id)
 		deleted++
-		slog.Warn("xai-autoban: credential deleted through Management API", "auth_id", id, "status", entry.StatusCode)
+		slog.Warn("xai-autoban: credential deleted through Management API",
+			"auth_id", id, "status", entry.StatusCode, "class", entryClass)
 		c.mu.Lock()
 		c.lastError = ""
 		c.mu.Unlock()
@@ -284,6 +288,30 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 	return deleted, firstErr
 }
 
+// deleteByClasses permanently deletes tracked credentials whose class is in classes
+// and also listed in deletable-classes config.
+func (c *autobanController) deleteByClasses(classes []string) (int, error) {
+	cfg := c.config()
+	allowed := make([]string, 0, len(classes))
+	for _, class := range classes {
+		class = strings.TrimSpace(strings.ToLower(class))
+		if class == "" {
+			continue
+		}
+		if !cfg.classDeletable(class) {
+			continue
+		}
+		allowed = append(allowed, class)
+	}
+	if len(allowed) == 0 {
+		return 0, fmt.Errorf("没有可删除的 class（请配置 deletable-classes，默认仅 permission）")
+	}
+	ids := c.state.authIDsByClasses(allowed)
+	// statusCode 0 = do not filter by HTTP status; class gate is applied inside deleteCredentials
+	return c.deleteCredentials(ids, 0)
+}
+
+// deleteByStatus keeps legacy path: only deletable classes among that HTTP status.
 func (c *autobanController) deleteByStatus(statusCode int) (int, error) {
 	if statusCode <= 0 {
 		return 0, fmt.Errorf("invalid status code")
