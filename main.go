@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.3.2"
+	pluginVersion = "1.3.3"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -793,8 +793,8 @@ func statusPage() string {
         <button class="quiet-danger" onclick="unbanStatus(401)">清除全部 401</button>
         <button class="quiet-danger" onclick="unbanStatus(402)">清除全部 402</button>
         <button class="quiet-danger" onclick="unbanStatus(403)">清除全部 403</button>
-        <button class="danger" onclick="deleteSelectedDeletable()">删除已选(可删 class)</button>
-        <button class="danger" onclick="deleteDeletableClasses()">删除全部可删 class</button>
+        <button class="danger" onclick="deleteSelectedDeletable()">删除已选(可删类型)</button>
+        <button class="danger" onclick="deleteDeletableClasses()">删除全部可删类型</button>
         <button class="quiet-danger" onclick="unbanStatus(429)">清除全部 429</button>
         <button class="danger" onclick="unbanAll()">全部解禁</button>
       </div>
@@ -804,12 +804,12 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态码</th><th>失败类型</th><th>24h用量 / 上限</th><th>原因</th><th>处置状态</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态码</th><th>失败类型</th><th>24h用量 / 上限</th><th>原因</th><th>当前处置</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。「失败类型」= 上游失败分类；「处置状态」= 是否已在 CPA 停用/恢复该凭证。永久删除仅针对可删类型（默认 permission）。</p>
+    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。「失败类型」= 上游失败分类；「当前处置」= 是否已在 CPA 停用/恢复该凭证。永久删除仅针对可删类型（默认 permission）。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
