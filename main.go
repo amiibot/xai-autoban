@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.3.0"
+	pluginVersion = "1.3.1"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -469,7 +469,7 @@ type banInfo struct {
 	Deletable          bool   `json:"deletable"`
 	LastError          string `json:"last_error,omitempty"`
 	// Optional rolling-24h usage join (observe only; never pre-ban).
-	Tokens24h   int64  `json:"tokens_24h,omitempty"`
+	Tokens24h   int64  `json:"tokens_24h"`
 	QuotaLimit  int64  `json:"quota_limit,omitempty"`
 	QuotaHealth string `json:"quota_health,omitempty"`
 	QuotaEmail  string `json:"quota_email,omitempty"`
@@ -804,7 +804,7 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态</th><th>Class</th><th>24h用量</th><th>原因</th><th>Management API</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态</th><th>Class</th><th>24h用量 / 上限</th><th>原因</th><th>Management API</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
@@ -832,7 +832,7 @@ func statusPage() string {
     const CLASS_COLORS={ok:'#12b76a',auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
     function colorForStatus(key){return STATUS_COLORS[String(key)]||'#98a2b3'}
     function colorForClass(key){return CLASS_COLORS[key]||'#98a2b3'}
-    function formatTokens(ban){if(!ban)return '—';if(!ban.tokens_24h){return ban.quota_health?String(ban.quota_health):'—'}const m=(Number(ban.tokens_24h)/1e6).toFixed(2);let s=m+'M';if(ban.quota_limit)s+=' / '+(Number(ban.quota_limit)/1e6).toFixed(2)+'M';if(ban.over_reference)s+=' ↑';return s}
+    function formatTokens(ban){if(!ban)return '—';if(!(ban.quota_health||ban.quota_limit||Number(ban.tokens_24h)>0))return '—';const tokens=Number(ban.tokens_24h||0);const m=(tokens/1e6).toFixed(2);let s=m+'M';const lim=Number(ban.quota_limit||0);if(lim>0)s+=' / '+(lim/1e6).toFixed(2)+'M';else s+=' / 2.00M';if(ban.over_reference)s+=' ↑';const health=String(ban.quota_health||'').toLowerCase();if(health&&health!=='ok'&&health!=='active'&&health!=='healthy')s+=' · '+ban.quota_health;return s}
     function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭（observe-usage / join-quota-state）';return}if(q.ok){el.className='quota-note ok';const src=q.source==='usage_sqlite'?'内嵌 usage.sqlite':(q.source||'state');el.textContent='用量观测：已连接 ['+src+'] '+(q.path||'')+' · 命中隔离行 '+Number(q.matched||0)+' · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'找不到 usage.sqlite')+'）。可配置 usage-db-path / XAI_AUTOBAN_USAGE_DB 或 CPAMP_USAGE_DB'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
     function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
