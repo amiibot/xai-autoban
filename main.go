@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.3.1"
+	pluginVersion = "1.3.2"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -770,8 +770,8 @@ func statusPage() string {
         <div class="chart-body"><div id="pieStatus" class="pie empty">无数据</div><div id="legendStatus" class="legend"></div></div>
       </div>
       <div class="chart-card">
-        <h2>失败 Class 分布</h2>
-        <p class="chart-sub">账号池占比：正常 + 细分类（permission / quota_free / …）</p>
+        <h2>失败类型分布</h2>
+        <p class="chart-sub">账号池占比：正常 + 失败类型（permission / quota_free / …）</p>
         <div class="chart-body"><div id="pieClass" class="pie empty">无数据</div><div id="legendClass" class="legend"></div></div>
       </div>
     </section>
@@ -804,12 +804,12 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态</th><th>Class</th><th>24h用量 / 上限</th><th>原因</th><th>Management API</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态码</th><th>失败类型</th><th>24h用量 / 上限</th><th>原因</th><th>处置状态</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。永久删除仅针对 deletable-classes（默认 permission）；可在配置中增加更多 class。</p>
+    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。「失败类型」= 上游失败分类；「处置状态」= 是否已在 CPA 停用/恢复该凭证。永久删除仅针对可删类型（默认 permission）。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
