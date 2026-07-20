@@ -34,10 +34,18 @@ type runtimeConfig struct {
 	AuthFailureCooldown time.Duration
 	StateFile           string
 	ClassifyBody        bool
-	// QuotaStateFile is optional path to grok-quota-state.json (or compatible).
+	// ObserveUsage enables embedded rolling-24h usage from CPAMP usage.sqlite.
+	// Default true — no separate grok-quota plugin required.
+	ObserveUsage bool
+	// UsageDBPath optional explicit path to usage.sqlite (else auto-detect).
+	UsageDBPath string
+	// AuthDir optional CPA auths directory for email enrichment.
+	AuthDir string
+	// QuotaStateFile is optional path to an external state JSON (legacy / fallback).
 	// Empty = auto-detect common CPA paths / env GROK_QUOTA_STATE_PATH.
 	QuotaStateFile string
-	// JoinQuotaState attaches rolling 24h usage onto ban rows when state is present.
+	// JoinQuotaState allows falling back to an external state file when
+	// ObserveUsage fails or is disabled. Default true (soft fallback only).
 	JoinQuotaState bool
 	// ClassDisableHours maps failure class → isolation duration.
 	// Missing classes fall back to DisableDuration.
@@ -58,6 +66,9 @@ type rawRuntimeConfig struct {
 	AuthFailureCooldownSeconds int                `yaml:"auth-failure-cooldown-seconds"`
 	StateFile                  string             `yaml:"state-file"`
 	ClassifyBody               *bool              `yaml:"classify-body"`
+	ObserveUsage               *bool              `yaml:"observe-usage"`
+	UsageDBPath                string             `yaml:"usage-db-path"`
+	AuthDir                    string             `yaml:"auth-dir"`
 	QuotaStateFile             string             `yaml:"quota-state-file"`
 	JoinQuotaState             *bool              `yaml:"join-quota-state"`
 	ClassDisableHours          map[string]float64 `yaml:"class-disable-hours"`
@@ -76,7 +87,8 @@ func defaultRuntimeConfig() runtimeConfig {
 		AuthFailureCooldown: defaultAuthFailureCooldown,
 		StateFile:           defaultStateFile,
 		ClassifyBody:        true,
-		JoinQuotaState:      true,
+		ObserveUsage:        true,
+		JoinQuotaState:      true, // file fallback only when sqlite observe fails
 		// Defaults: all tracked failures isolate 24h (free 429 window / auth recovery window).
 		ClassDisableHours: defaultClassDisableHours(defaultDisableHours * time.Hour),
 		// Permanent delete only for hard permission denials by default; more classes can be enabled.
@@ -147,6 +159,15 @@ func parseRuntimeConfig(raw []byte) (runtimeConfig, error) {
 	}
 	if input.ClassifyBody != nil {
 		cfg.ClassifyBody = *input.ClassifyBody
+	}
+	if input.ObserveUsage != nil {
+		cfg.ObserveUsage = *input.ObserveUsage
+	}
+	if value := strings.TrimSpace(input.UsageDBPath); value != "" {
+		cfg.UsageDBPath = filepath.Clean(value)
+	}
+	if value := strings.TrimSpace(input.AuthDir); value != "" {
+		cfg.AuthDir = filepath.Clean(value)
 	}
 	if value := strings.TrimSpace(input.QuotaStateFile); value != "" {
 		cfg.QuotaStateFile = filepath.Clean(value)

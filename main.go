@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.2.1"
+	pluginVersion = "1.3.0"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -160,6 +160,11 @@ func pluginRegistration() registration {
 				{Name: "state-file", Type: pluginapi.ConfigFieldTypeString, Description: "自动恢复状态文件，默认 xai-autoban-state.json。"},
 				{Name: "classify-body", Type: pluginapi.ConfigFieldTypeString, Description: "是否解析失败 body 做细分类，默认 true。"},
 				{Name: "deletable-classes", Type: pluginapi.ConfigFieldTypeArray, Description: "允许永久删除的失败 class，默认 [permission]。"},
+				{Name: "observe-usage", Type: pluginapi.ConfigFieldTypeString, Description: "是否内嵌读取 CPAMP usage.sqlite 做 24h 用量观测，默认 true（不依赖 grok-quota）。"},
+				{Name: "usage-db-path", Type: pluginapi.ConfigFieldTypeString, Description: "usage.sqlite 路径；空则自动探测。"},
+				{Name: "auth-dir", Type: pluginapi.ConfigFieldTypeString, Description: "CPA auths 目录（可选，用于邮箱 enrich）。"},
+				{Name: "join-quota-state", Type: pluginapi.ConfigFieldTypeString, Description: "sqlite 失败时是否回退读 grok-quota-state.json，默认 true。"},
+				{Name: "quota-state-file", Type: pluginapi.ConfigFieldTypeString, Description: "可选外部 state JSON 路径（回退用）。"},
 			},
 		},
 		Capabilities: registrationCapability{UsagePlugin: true, Scheduler: true, ManagementAPI: true},
@@ -436,10 +441,11 @@ type quotaJoinInfo struct {
 	Enabled bool   `json:"enabled"`
 	OK      bool   `json:"ok"`
 	Path    string `json:"path,omitempty"`
+	Source  string `json:"source,omitempty"` // usage_sqlite | state_file
 	Error   string `json:"error,omitempty"`
 	// Matched is how many ban rows found a quota record.
 	Matched int `json:"matched"`
-	// PoolAccounts is number of accounts in the quota state file (for pie base).
+	// PoolAccounts is number of accounts in the usage pool (for pie base).
 	PoolAccounts int `json:"pool_accounts,omitempty"`
 }
 
@@ -462,7 +468,7 @@ type banInfo struct {
 	ManagementDisabled bool   `json:"management_disabled"`
 	Deletable          bool   `json:"deletable"`
 	LastError          string `json:"last_error,omitempty"`
-	// Optional grok-quota join (observe only).
+	// Optional rolling-24h usage join (observe only; never pre-ban).
 	Tokens24h   int64  `json:"tokens_24h,omitempty"`
 	QuotaLimit  int64  `json:"quota_limit,omitempty"`
 	QuotaHealth string `json:"quota_health,omitempty"`
@@ -483,11 +489,12 @@ func currentStatus() statusInfo {
 	cfg := autoban.config()
 
 	var qidx quotaJoinIndex
-	qinfo := quotaJoinInfo{Enabled: cfg.JoinQuotaState}
-	if cfg.JoinQuotaState {
-		qidx = loadQuotaJoin(cfg.QuotaStateFile)
+	qinfo := quotaJoinInfo{Enabled: cfg.ObserveUsage || cfg.JoinQuotaState}
+	if qinfo.Enabled {
+		qidx = loadQuotaUsage(cfg)
 		qinfo.OK = qidx.OK
 		qinfo.Path = qidx.Path
+		qinfo.Source = qidx.Source
 		qinfo.Error = qidx.Error
 		qinfo.PoolAccounts = qidx.accountCount()
 	}
@@ -518,7 +525,7 @@ func currentStatus() statusInfo {
 			ResetAt: entry.ResetAt.Format(time.RFC3339), RemainingSeconds: remaining,
 			ManagementDisabled: entry.ManagementDisabled, Deletable: cfg.classDeletable(class), LastError: entry.LastError,
 		}
-		if cfg.JoinQuotaState && qidx.OK {
+		if qidx.OK {
 			if q, ok := qidx.lookup(id, entry.AuthIndex, ""); ok {
 				matched++
 				info.Tokens24h = q.Tokens24h
@@ -576,7 +583,7 @@ func currentStatus() statusInfo {
 
 // estimatePool returns total xAI credentials, normal (enabled & not banned), and
 // disabled-but-not-banned counts for pie charts. Prefer Management API list;
-// fall back to grok-quota state size; else banned-only.
+// fall back to usage observation pool size; else banned-only.
 func estimatePool(cfg runtimeConfig, snapshot map[string]banEntry, bannedKeys map[string]struct{}, qidx quotaJoinIndex) (poolTotal, normal, disabledExtra int, source string) {
 	bannedN := len(snapshot)
 	// 1) Management API — authoritative pool of xAI auth files.
@@ -601,11 +608,15 @@ func estimatePool(cfg runtimeConfig, snapshot map[string]banEntry, bannedKeys ma
 			return poolTotal, normal, disabledExtra, source
 		}
 	}
-	// 2) Quota state account count (observation pool).
+	// 2) Usage observation account count (sqlite / state file).
 	if qidx.OK {
 		n := qidx.accountCount()
 		if n > 0 {
-			source = "quota_state"
+			if qidx.Source == "usage_sqlite" {
+				source = "usage_sqlite"
+			} else {
+				source = "quota_state"
+			}
 			poolTotal = n
 			// Normal ≈ pool - currently banned (cannot know disabled without management).
 			normal = n - bannedN
@@ -764,7 +775,7 @@ func statusPage() string {
         <div class="chart-body"><div id="pieClass" class="pie empty">无数据</div><div id="legendClass" class="legend"></div></div>
       </div>
     </section>
-    <p id="quotaNote" class="quota-note">用量观测：未连接 grok-quota 状态文件</p>
+    <p id="quotaNote" class="quota-note">用量观测：初始化中…</p>
 
     <section class="toolbar">
       <div class="toolbar-row">
@@ -822,7 +833,7 @@ func statusPage() string {
     function colorForStatus(key){return STATUS_COLORS[String(key)]||'#98a2b3'}
     function colorForClass(key){return CLASS_COLORS[key]||'#98a2b3'}
     function formatTokens(ban){if(!ban)return '—';if(!ban.tokens_24h){return ban.quota_health?String(ban.quota_health):'—'}const m=(Number(ban.tokens_24h)/1e6).toFixed(2);let s=m+'M';if(ban.quota_limit)s+=' / '+(Number(ban.quota_limit)/1e6).toFixed(2)+'M';if(ban.over_reference)s+=' ↑';return s}
-    function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭 join-quota-state';return}if(q.ok){el.className='quota-note ok';el.textContent='用量观测：已连接 '+(q.path||'grok-quota-state')+' · 命中 '+Number(q.matched||0)+' 条 · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'缺少 grok-quota-state.json')+'）。可并排安装 grok-quota 或配置 quota-state-file'}
+    function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭（observe-usage / join-quota-state）';return}if(q.ok){el.className='quota-note ok';const src=q.source==='usage_sqlite'?'内嵌 usage.sqlite':(q.source||'state');el.textContent='用量观测：已连接 ['+src+'] '+(q.path||'')+' · 命中隔离行 '+Number(q.matched||0)+' · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'找不到 usage.sqlite')+'）。可配置 usage-db-path / XAI_AUTOBAN_USAGE_DB 或 CPAMP_USAGE_DB'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
     function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
     function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.deletable?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}

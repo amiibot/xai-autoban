@@ -43,12 +43,14 @@ plugins:
 - 面板支持按 Class 展示；永久删除仅 `deletable-classes`（默认只有 `permission`），也可多选 class 批量删除。
 - 插件 id / 文件名仍为 `xai-autoban`，与 CPA 原安装路径兼容。
 
-### 用量观测与圆饼图（v1.2）
+### 用量观测与圆饼图（v1.3，内嵌）
 
-- **不预 ban**：不会因为用量高或 grok-quota 标记而自动隔离。
-- 若存在 `plugins/grok-quota-state.json`（或配置 `quota-state-file` / 环境变量 `GROK_QUOTA_STATE_PATH`），面板为**已隔离**行附加只读 `tokens_24h`。
-- 观测页展示两个圆饼图：账号池 **HTTP 状态**（含**正常** + 401/402/403/429）与 **Class**（含正常 + permission/quota…）。池规模优先 Management 列表，其次 grok-quota-state。
-- 推荐与 [grok-quota](https://github.com/gzy3894-png/grok-quota) **并排安装**；本插件只读其状态文件。
+- **单插件**：v1.3 起直接只读 CPAMP `usage.sqlite` 汇总近 24h token，**不再依赖**并排安装 grok-quota。
+- **不预 ban**：不会因为用量高或额度日志标记而自动隔离（隔离仍只看 401/402/403/429 等实时失败 + class TTL）。
+- 面板为隔离行附加只读 `tokens_24h`；圆饼图含**正常** + 401/402/403/429 与 class。
+- 池规模优先 Management 列表，其次 usage 观测池。
+- 路径探测：`usage-db-path` / `XAI_AUTOBAN_USAGE_DB` / `CPAMP_USAGE_DB` / 常见 `CPAMP/data/usage.sqlite`、`data/usage.sqlite`。
+- 可选回退：`join-quota-state` + `quota-state-file` 仍可读外部 `grok-quota-state.json`（sqlite 找不到时）。
 
 
 - 只处理 `xai` provider，不影响 Codex、Claude、Gemini 等其他凭据。

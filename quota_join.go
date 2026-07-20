@@ -8,18 +8,8 @@ import (
 	"time"
 )
 
-// joinQuotaState enriches ban records with rolling-24h usage from a sibling
-// grok-quota (or compatible) state file. Observation only — never mutates auth.
-//
-// Expected layout (subset of grok-quota-state.json):
-//
-//	{
-//	  "accounts": [ {"auth_index":"...","email":"...","tokens_24h":123,"quota_health":"ok"} ],
-//	  "by_auth_index": { "...": { ... } }
-//	}
-//
-// Missing file / parse errors are silent: join is best-effort.
-
+// quotaAccountView is the lean per-account observation row used by the panel.
+// Built either from embedded usage.sqlite observer or a compatible state file.
 type quotaAccountView struct {
 	AuthIndex   string `json:"auth_index"`
 	Email       string `json:"email,omitempty"`
@@ -33,20 +23,50 @@ type quotaAccountView struct {
 }
 
 type quotaStateFile struct {
-	GeneratedAt  string                       `json:"generated_at,omitempty"`
-	Accounts     []quotaAccountView           `json:"accounts,omitempty"`
-	ByAuthIndex  map[string]quotaAccountView  `json:"by_auth_index,omitempty"`
-	Summary      map[string]any               `json:"summary,omitempty"`
-	SourcePlugin string                       `json:"plugin,omitempty"`
+	GeneratedAt  string                      `json:"generated_at,omitempty"`
+	Accounts     []quotaAccountView          `json:"accounts,omitempty"`
+	ByAuthIndex  map[string]quotaAccountView `json:"by_auth_index,omitempty"`
+	Summary      map[string]any              `json:"summary,omitempty"`
+	SourcePlugin string                      `json:"plugin,omitempty"`
 }
 
 type quotaJoinIndex struct {
 	LoadedAt time.Time
 	Path     string
+	Source   string // usage_sqlite | state_file
 	ByIndex  map[string]quotaAccountView
 	ByEmail  map[string]quotaAccountView
 	OK       bool
 	Error    string
+}
+
+// loadQuotaUsage is the single entry for observation join.
+// Prefer embedded CPAMP usage.sqlite; optionally fall back to an external state file.
+func loadQuotaUsage(cfg runtimeConfig) quotaJoinIndex {
+	if cfg.ObserveUsage {
+		idx := loadQuotaObserve(cfg.UsageDBPath, cfg.AuthDir)
+		if idx.OK {
+			return idx
+		}
+		// Soft-fail: try external file if enabled.
+		if cfg.JoinQuotaState {
+			fileIdx := loadQuotaJoinFile(cfg.QuotaStateFile)
+			if fileIdx.OK {
+				return fileIdx
+			}
+			// Keep the more specific sqlite error if file also missing.
+			if fileIdx.Error != "" && idx.Error != "" {
+				idx.Error = idx.Error + "; fallback: " + fileIdx.Error
+			} else if idx.Error == "" {
+				idx.Error = fileIdx.Error
+			}
+		}
+		return idx
+	}
+	if cfg.JoinQuotaState {
+		return loadQuotaJoinFile(cfg.QuotaStateFile)
+	}
+	return quotaJoinIndex{Error: "usage observation disabled"}
 }
 
 func defaultQuotaStateCandidates() []string {
@@ -56,7 +76,6 @@ func defaultQuotaStateCandidates() []string {
 			out = append(out, v)
 		}
 	}
-	// Common CPA-relative paths (cwd is usually the CPA data root).
 	out = append(out,
 		filepath.Join("plugins", "grok-quota-state.json"),
 		"grok-quota-state.json",
@@ -65,11 +84,13 @@ func defaultQuotaStateCandidates() []string {
 	return out
 }
 
-func loadQuotaJoin(explicitPath string) quotaJoinIndex {
+// loadQuotaJoinFile reads a sibling/compatible state JSON (optional fallback).
+func loadQuotaJoinFile(explicitPath string) quotaJoinIndex {
 	idx := quotaJoinIndex{
 		LoadedAt: time.Now().UTC(),
 		ByIndex:  map[string]quotaAccountView{},
 		ByEmail:  map[string]quotaAccountView{},
+		Source:   "state_file",
 	}
 	candidates := defaultQuotaStateCandidates()
 	if p := strings.TrimSpace(explicitPath); p != "" {
@@ -124,6 +145,11 @@ func loadQuotaJoin(explicitPath string) quotaJoinIndex {
 		idx.Error = "quota state empty"
 	}
 	return idx
+}
+
+// Deprecated name kept for tests that call loadQuotaJoin directly (file path).
+func loadQuotaJoin(explicitPath string) quotaJoinIndex {
+	return loadQuotaJoinFile(explicitPath)
 }
 
 func (idx quotaJoinIndex) lookup(authID, authIndex, email string) (quotaAccountView, bool) {
