@@ -1,4 +1,5 @@
 /dist/
+/local/
 *.so
 *.h
 *.dll
