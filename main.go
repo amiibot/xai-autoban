@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.3.4"
+	pluginVersion = "1.3.5"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -159,7 +159,7 @@ func pluginRegistration() registration {
 				{Name: "status-codes", Type: pluginapi.ConfigFieldTypeArray, Description: "触发停用的 HTTP 状态码，默认 401、402、403、429。"},
 				{Name: "state-file", Type: pluginapi.ConfigFieldTypeString, Description: "自动恢复状态文件，默认 xai-autoban-state.json。"},
 				{Name: "classify-body", Type: pluginapi.ConfigFieldTypeString, Description: "是否解析失败 body 做细分类，默认 true。"},
-				{Name: "deletable-classes", Type: pluginapi.ConfigFieldTypeArray, Description: "允许永久删除的失败类型，默认 [permission]（按类型不是按 403 状态码）。"},
+				
 				{Name: "observe-usage", Type: pluginapi.ConfigFieldTypeString, Description: "是否内嵌读取 CPAMP usage.sqlite 做 24h 用量观测，默认 true（不依赖 grok-quota）。"},
 				{Name: "usage-db-path", Type: pluginapi.ConfigFieldTypeString, Description: "usage.sqlite 路径；空则自动探测。"},
 				{Name: "auth-dir", Type: pluginapi.ConfigFieldTypeString, Description: "CPA auths 目录（可选，用于邮箱 enrich）。"},
@@ -218,8 +218,8 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: managementPrefix + "/bans", Description: "List xAI credentials excluded by xai-autoban."},
 			{Method: http.MethodPost, Path: managementPrefix + "/unban", Description: "Release one xAI credential. Body: {\"auth_id\":\"...\"}."},
 			{Method: http.MethodPost, Path: managementPrefix + "/unban-all", Description: "Release all credentials held by xai-autoban."},
-			{Method: http.MethodPost, Path: managementPrefix + "/delete", Description: "Permanently delete one credential if class is deletable. Body: {\"auth_id\":\"...\"}."},
-			{Method: http.MethodPost, Path: managementPrefix + "/delete-403", Description: "Legacy: delete HTTP 403 credentials in deletable-classes (default permission)."},
+			{Method: http.MethodPost, Path: managementPrefix + "/delete", Description: "Permanently delete one 403 credential via Management API. Body: {\"auth_id\":\"...\"}."},
+			{Method: http.MethodPost, Path: managementPrefix + "/delete-403", Description: "Permanently delete all currently tracked 403 credentials via Management API."},
 			{Method: http.MethodPost, Path: managementPrefix + "/delete-classes", Description: "Delete by classes. Body: {\"classes\":[\"permission\"]}."},
 			{Method: http.MethodPost, Path: managementPrefix + "/import", Description: "Restore a previously exported ban snapshot."},
 		},
@@ -270,7 +270,7 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		if strings.TrimSpace(body.AuthID) == "" {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "missing_auth_id"})
 		}
-		deleted, err := autoban.deleteCredentials([]string{strings.TrimSpace(body.AuthID)}, 0)
+		deleted, err := autoban.deleteCredentials([]string{strings.TrimSpace(body.AuthID)}, 403)
 		if err != nil && deleted == 0 {
 			return jsonResponse(http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "deleted": deleted, "status": currentStatus()})
 		}
@@ -281,21 +281,7 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 			return jsonResponse(http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "deleted": deleted, "status": currentStatus()})
 		}
 		return jsonResponse(http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "status": currentStatus()})
-	case method == http.MethodPost && strings.HasSuffix(strings.TrimRight(req.Path, "/"), managementPrefix+"/delete-classes"):
-		var body struct {
-			Classes []string `json:"classes"`
-		}
-		_ = json.Unmarshal(req.Body, &body)
-		if len(body.Classes) == 0 {
-			if raw := strings.TrimSpace(req.Query.Get("classes")); raw != "" {
-				body.Classes = strings.Split(raw, ",")
-			}
-		}
-		deleted, err := autoban.deleteByClasses(body.Classes)
-		if err != nil && deleted == 0 {
-			return jsonResponse(http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "deleted": deleted, "status": currentStatus()})
-		}
-		return jsonResponse(http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "status": currentStatus()})
+
 	case method == http.MethodPost && strings.HasSuffix(strings.TrimRight(req.Path, "/"), managementPrefix+"/import"):
 		return importSnapshot(req.Body)
 	case method == http.MethodGet && matchesResourcePath(req.Path, "data"):
@@ -347,7 +333,17 @@ func publicAction(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "missing_auth_id"})
 		}
 		var err error
-		deleted, err = autoban.deleteCredentials([]string{id}, 0)
+		deleted, err = autoban.deleteCredentials([]string{id}, 403)
+		if err != nil && deleted == 0 {
+			slog.Error("xai-autoban: public delete action failed", "operation", op, "error", err)
+			return jsonResponse(http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "deleted": deleted, "status": currentStatus()})
+		}
+		slog.Warn("xai-autoban: public delete action", "operation", op, "deleted", deleted)
+		return jsonResponse(http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "status": currentStatus()})
+	case "delete-many":
+		rawIDs := strings.Split(req.Query.Get("auth_ids"), ",")
+		var err error
+		deleted, err = autoban.deleteCredentials(rawIDs, 403)
 		if err != nil && deleted == 0 {
 			slog.Error("xai-autoban: public delete action failed", "operation", op, "error", err)
 			return jsonResponse(http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "deleted": deleted, "status": currentStatus()})
@@ -363,19 +359,7 @@ func publicAction(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 		}
 		slog.Warn("xai-autoban: public delete action", "operation", op, "deleted", deleted)
 		return jsonResponse(http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "status": currentStatus()})
-	case "delete-classes":
-		raw := strings.TrimSpace(req.Query.Get("classes"))
-		if raw == "" {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "missing_classes"})
-		}
-		var err error
-		deleted, err = autoban.deleteByClasses(strings.Split(raw, ","))
-		if err != nil && deleted == 0 {
-			slog.Error("xai-autoban: public delete action failed", "operation", op, "error", err)
-			return jsonResponse(http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "deleted": deleted, "status": currentStatus()})
-		}
-		slog.Warn("xai-autoban: public delete action", "operation", op, "deleted", deleted, "classes", raw)
-		return jsonResponse(http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "status": currentStatus()})
+
 	default:
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid_operation"})
 	}
@@ -523,7 +507,7 @@ func currentStatus() statusInfo {
 			AuthID: id, AuthIndex: entry.AuthIndex, StatusCode: entry.StatusCode, Class: class, Reason: entry.Reason,
 			BodyFingerprint: entry.BodyFingerprint, BannedAt: entry.BannedAt.Format(time.RFC3339),
 			ResetAt: entry.ResetAt.Format(time.RFC3339), RemainingSeconds: remaining,
-			ManagementDisabled: entry.ManagementDisabled, Deletable: cfg.classDeletable(class), LastError: entry.LastError,
+			ManagementDisabled: entry.ManagementDisabled, Deletable: entry.StatusCode == 403, LastError: entry.LastError,
 		}
 		if qidx.OK {
 			if q, ok := qidx.lookup(id, entry.AuthIndex, ""); ok {
@@ -576,7 +560,7 @@ func currentStatus() statusInfo {
 	return statusInfo{
 		Plugin: pluginName, Version: pluginVersion, Count: len(items),
 		PoolTotal: poolTotal, NormalCount: normalCount,
-		DeletableClasses: cfg.deletableClassList(), Charts: charts, QuotaJoin: qinfo,
+		DeletableClasses: []string{}, Charts: charts, QuotaJoin: qinfo,
 		Management: management, Bans: items,
 	}
 }
@@ -793,8 +777,8 @@ func statusPage() string {
         <button class="quiet-danger" onclick="unbanStatus(401)">清除全部 401</button>
         <button class="quiet-danger" onclick="unbanStatus(402)">清除全部 402</button>
         <button class="quiet-danger" onclick="unbanStatus(403)">清除全部 403</button>
-        <button class="danger" onclick="deleteSelectedDeletable()">永久删除已选(可删失败类型)</button>
-        <button class="danger" onclick="deleteDeletableClasses()">永久删除全部可删失败类型</button>
+        <button class="danger" onclick="deleteSelected403()">删除已选 403</button>
+        <button class="danger" onclick="deleteAll403()">删除全部 403 账号</button>
         <button class="quiet-danger" onclick="unbanStatus(429)">清除全部 429</button>
         <button class="danger" onclick="unbanAll()">全部解禁</button>
       </div>
@@ -809,7 +793,7 @@ func statusPage() string {
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。「失败类型」= 上游失败分类；「当前处置」= 是否已在 CPA 停用/恢复该凭证。永久删除按「失败类型」白名单（deletable-classes，默认 permission），不是按状态码 403。</p>
+    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。「失败类型」= 上游失败分类（仅展示）；「当前处置」= 是否已在 CPA 停用/恢复。永久删除仅针对状态码 403（删除凭据文件，不是解禁）。勾选用于解禁已选，或删除已选中的 403。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
@@ -832,20 +816,20 @@ func statusPage() string {
     const CLASS_COLORS={ok:'#12b76a',auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
     function colorForStatus(key){return STATUS_COLORS[String(key)]||'#98a2b3'}
     function colorForClass(key){return CLASS_COLORS[key]||'#98a2b3'}
-    function formatTokens(ban){if(!ban)return '—';if(!(ban.quota_health||ban.quota_limit||Number(ban.tokens_24h)>0))return '—';const tokens=Number(ban.tokens_24h||0);const m=(tokens/1e6).toFixed(2);let s=m+'M';const lim=Number(ban.quota_limit||0);if(lim>0)s+=' / '+(lim/1e6).toFixed(2)+'M';else s+=' / 2.00M';if(ban.over_reference)s+=' ↑';const health=String(ban.quota_health||'').toLowerCase();if(health&&health!=='ok'&&health!=='active'&&health!=='healthy')s+=' · '+ban.quota_health;return s}
+    function formatTokens(ban){if(!ban)return '—';const tokens=Number(ban.tokens_24h||0);const lim=Number(ban.quota_limit||0);const hasUsage=lim>0||tokens>0||ban.over_reference;const joined=hasUsage||Boolean(ban.quota_health);if(!joined)return '—';const m=(tokens/1e6).toFixed(2);let s=m+'M';if(lim>0)s+=' / '+(lim/1e6).toFixed(2)+'M';else s+=' / 2.00M';if(ban.over_reference)s+=' ↑';return s}
     function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭（observe-usage / join-quota-state）';return}if(q.ok){el.className='quota-note ok';const src=q.source==='usage_sqlite'?'内嵌 usage.sqlite':(q.source||'state');el.textContent='用量观测：已连接 ['+src+'] '+(q.path||'')+' · 命中隔离行 '+Number(q.matched||0)+' · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'找不到 usage.sqlite')+'）。可配置 usage-db-path / XAI_AUTOBAN_USAGE_DB 或 CPAMP_USAGE_DB'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
     function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
-    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.deletable?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">永久删除</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
+    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
     function changePage(delta){state.page+=delta;render();document.querySelector('.table-wrap').scrollTop=0}
     async function runAction(params,question,successText){if(question&&!confirm(question))return;try{setMessage('正在执行操作...');const result=await api('/action?'+new URLSearchParams(params));state.selected.clear();const done=successText?successText(result):('操作完成，已解禁 '+(result.removed||0)+' 个凭据');setMessage(done);await loadData(true)}catch(error){setMessage(error.message,true)}}
     function unbanOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'unban',auth_id:id},'确认解禁该凭据？\n'+id)}
     function unbanStatus(status){const n=state.bans.filter(x=>x.status_code===status).length;runAction({op:'unban-status',status},'确认解禁全部 '+n+' 个 '+status+' 凭据？')}
     function unbanAll(){runAction({op:'unban-all'},'确认解禁全部 '+state.bans.length+' 个凭据？此操作会立即改变调度池。')}
     function unbanSelected(){const ids=[...state.selected];runAction({op:'unban-many',auth_ids:ids.join(',')},'确认解禁已选择的 '+ids.length+' 个凭据？')}
-    function deleteOne(encoded){const id=decodeURIComponent(encoded);const ban=state.bans.find(x=>x.auth_id===id);const cls=(ban&&ban.class)||'legacy';runAction({op:'delete',auth_id:id},'确认永久删除该凭证？\n'+id+'\n失败类型='+cls+'\n仅配置中的可删失败类型会执行删除（默认 permission）。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个账号')}
-    function deleteSelectedDeletable(){const selected=state.bans.filter(x=>state.selected.has(x.auth_id)&&x.deletable);if(!selected.length){setMessage('没有已选且可删除的账号',true);return}const classes=[...new Set(selected.map(x=>x.class||'legacy'))];runAction({op:'delete-classes',classes:classes.join(',')},'确认按失败类型永久删除已选 '+selected.length+' 个账号？\n涉及类型：'+classes.join(', ')+'\n不可删类型会被跳过。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个账号')}
-    function deleteDeletableClasses(){const classes=(state.deletable_classes||['permission']);const n=state.bans.filter(x=>x.deletable).length;runAction({op:'delete-classes',classes:classes.join(',')},'确认永久删除全部可删失败类型？\n类型：'+classes.join(', ')+'\n约 '+n+' 个账号（按失败类型，不是按状态码 403）。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个账号')}
+    function deleteOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'delete',auth_id:id},'确认永久删除该 403 账号？\n'+id+'\n\n此操作会从 CPA 删除凭据文件，不是解除禁用。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')},'确认永久删除该凭证？\n'+id+'\n失败类型='+cls+'\n仅配置中的可删失败类型会执行删除（默认 permission）。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个账号')}
+    function deleteSelected403(){const selected=state.bans.filter(x=>state.selected.has(x.auth_id)&&x.status_code===403);if(!selected.length){setMessage('没有已选的 403 账号',true);return}const ids=selected.map(x=>x.auth_id);runAction({op:'delete-many',auth_ids:ids.join(',')},'确认永久删除已选 '+ids.length+' 个 403 账号？\n此操作会从 CPA 删除凭据文件，不是解除禁用。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
+    function deleteAll403(){const n=state.bans.filter(x=>x.status_code===403).length;runAction({op:'delete-403'},'确认永久删除全部 '+n+' 个 403 账号？\n此操作会从 CPA 删除凭据文件，不是解除禁用，且不可恢复。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
     async function copyVisible(){const ids=filtered().map(x=>x.auth_id).join('\n');try{await navigator.clipboard.writeText(ids);setMessage('已复制 '+filtered().length+' 个 Auth ID')}catch(_){setMessage('浏览器拒绝访问剪贴板',true)}}
 
     $('search').addEventListener('input',event=>{state.query=event.target.value.trim();state.page=1;render()});

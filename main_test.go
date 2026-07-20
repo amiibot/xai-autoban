@@ -57,12 +57,12 @@ func TestPublicStatusPageHasNoManagementAuthentication(t *testing.T) {
 			t.Fatalf("page still contains authenticated management flow: %q", forbidden)
 		}
 	}
-	for _, required := range []string{"window.location.pathname", "unbanSelected", "unbanStatus", "autoRefresh", "deleteOne", "deleteDeletableClasses", "data-delete"} {
+	for _, required := range []string{"window.location.pathname", "unbanSelected", "unbanStatus", "autoRefresh", "deleteOne", "deleteAll403", "deleteSelected403", "data-delete"} {
 		if !strings.Contains(page, required) {
 			t.Fatalf("page is missing %q", required)
 		}
 	}
-	if !strings.Contains(page, "删除账号") || !strings.Contains(page, "删除全部可删 class") {
+	if !strings.Contains(page, "删除账号") || !strings.Contains(page, "删除全部 403 账号") {
 		t.Fatal("page is missing permanent delete controls")
 	}
 }
@@ -311,21 +311,21 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 	}
 	autoban = controller
 
-	// payment (402) not deletable by class gate.
-	deleted, err := controller.deleteCredentials([]string{"payment"}, 0)
+	// payment (402) not deleted when filtering for 403.
+	deleted, err := controller.deleteCredentials([]string{"payment"}, 403)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if deleted != 0 {
 		t.Fatalf("payment credential should not be deleted: %d", deleted)
 	}
-	// quota_free 403 not deletable by default.
-	deleted, err = controller.deleteCredentials([]string{"quota"}, 0)
+	// any 403 is deletable (class ignored).
+	deleted, err = controller.deleteCredentials([]string{"quota"}, 403)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 0 {
-		t.Fatalf("quota_free should not be deleted: %d", deleted)
+	if deleted != 1 {
+		t.Fatalf("quota_free 403 should be deleted: %d", deleted)
 	}
 
 	response := publicAction(pluginapi.ManagementRequest{Query: url.Values{"op": {"delete"}, "auth_id": {"forbidden"}}})
@@ -333,19 +333,19 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", response.StatusCode, response.Body)
 	}
 	status := currentStatus()
-	// payment + quota remain; forbidden (permission) deleted
-	if status.Count != 2 {
+	// only payment remains
+	if status.Count != 1 {
 		t.Fatalf("unexpected bans after delete: count=%d %#v", status.Count, status)
 	}
 	ids := map[string]bool{}
 	for _, b := range status.Bans {
 		ids[b.AuthID] = true
 	}
-	if !ids["payment"] || !ids["quota"] || ids["forbidden"] {
+	if !ids["payment"] || ids["quota"] || ids["forbidden"] {
 		t.Fatalf("unexpected bans after delete: %#v", status.Bans)
 	}
-	if len(deletedNames) == 0 {
-		t.Fatal("expected management delete call")
+	if len(deletedNames) < 2 {
+		t.Fatalf("expected management delete calls, got %#v", deletedNames)
 	}
 }
 
@@ -394,19 +394,15 @@ func TestPublicDeleteAll403(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", response.StatusCode, response.Body)
 	}
 	status := currentStatus()
-	// permission 403 deleted; rate_limit + quota_free remain
-	if status.Count != 2 {
+	// all 403 deleted; only 429 remains
+	if status.Count != 1 {
 		t.Fatalf("unexpected bans after delete-403: count=%d %#v", status.Count, status)
 	}
-	classes := map[string]bool{}
-	for _, b := range status.Bans {
-		classes[b.Class] = true
+	if status.Bans[0].AuthID != "c" || status.Bans[0].StatusCode != 429 {
+		t.Fatalf("expected only rate_limit remaining: %#v", status.Bans)
 	}
-	if !classes[classRateLimit] || !classes[classQuotaFree] {
-		t.Fatalf("expected rate_limit and quota_free remaining: %#v", status.Bans)
-	}
-	if deleteCount < 2 {
-		t.Fatalf("expected at least 2 delete calls, got %d", deleteCount)
+	if deleteCount != 3 {
+		t.Fatalf("expected 3 delete calls for three 403s, got %d", deleteCount)
 	}
 }
 

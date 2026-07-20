@@ -220,8 +220,8 @@ func (c *autobanController) process() {
 
 
 // deleteCredentials permanently removes auth files for the given IDs via Management API.
-// Only credentials whose failure class is in deletable-classes are deleted.
-// Unlike release/unban, this does not re-enable the credential.
+// When statusCode > 0, only entries currently tracked with that HTTP status are deleted
+// (upstream behavior: permanent delete is for 403). Unlike release/unban, this does not re-enable.
 func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) (int, error) {
 	ids := make([]string, 0, len(authIDs))
 	for _, id := range authIDs {
@@ -234,7 +234,6 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 		return 0, nil
 	}
 
-	cfg := c.config()
 	c.mu.RLock()
 	client := c.client
 	blockedUntil := c.blockedUntil
@@ -255,13 +254,6 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 			continue
 		}
 		if statusCode > 0 && entry.StatusCode != statusCode {
-			continue
-		}
-		entryClass := entry.Class
-		if entryClass == "" {
-			entryClass = classLegacy
-		}
-		if !cfg.classDeletable(entryClass) {
 			continue
 		}
 		err := client.deleteAuthFile(context.Background(), id, entry.AuthIndex)
@@ -285,7 +277,7 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 		_ = c.state.clear(id)
 		deleted++
 		slog.Warn("xai-autoban: credential deleted through Management API",
-			"auth_id", id, "status", entry.StatusCode, "class", entryClass)
+			"auth_id", id, "status", entry.StatusCode, "class", entry.Class)
 		c.mu.Lock()
 		c.lastError = ""
 		c.mu.Unlock()
@@ -296,30 +288,7 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 	return deleted, firstErr
 }
 
-// deleteByClasses permanently deletes tracked credentials whose class is in classes
-// and also listed in deletable-classes config.
-func (c *autobanController) deleteByClasses(classes []string) (int, error) {
-	cfg := c.config()
-	allowed := make([]string, 0, len(classes))
-	for _, class := range classes {
-		class = strings.TrimSpace(strings.ToLower(class))
-		if class == "" {
-			continue
-		}
-		if !cfg.classDeletable(class) {
-			continue
-		}
-		allowed = append(allowed, class)
-	}
-	if len(allowed) == 0 {
-		return 0, fmt.Errorf("没有可删除的 class（请配置 deletable-classes，默认仅 permission）")
-	}
-	ids := c.state.authIDsByClasses(allowed)
-	// statusCode 0 = do not filter by HTTP status; class gate is applied inside deleteCredentials
-	return c.deleteCredentials(ids, 0)
-}
-
-// deleteByStatus keeps legacy path: only deletable classes among that HTTP status.
+// deleteByStatus permanently deletes all tracked credentials with the given HTTP status (upstream: 403).
 func (c *autobanController) deleteByStatus(statusCode int) (int, error) {
 	if statusCode <= 0 {
 		return 0, fmt.Errorf("invalid status code")
