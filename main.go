@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.3.5"
+	pluginVersion = "1.3.6"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -827,7 +827,7 @@ func statusPage() string {
     function unbanStatus(status){const n=state.bans.filter(x=>x.status_code===status).length;runAction({op:'unban-status',status},'确认解禁全部 '+n+' 个 '+status+' 凭据？')}
     function unbanAll(){runAction({op:'unban-all'},'确认解禁全部 '+state.bans.length+' 个凭据？此操作会立即改变调度池。')}
     function unbanSelected(){const ids=[...state.selected];runAction({op:'unban-many',auth_ids:ids.join(',')},'确认解禁已选择的 '+ids.length+' 个凭据？')}
-    function deleteOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'delete',auth_id:id},'确认永久删除该 403 账号？\n'+id+'\n\n此操作会从 CPA 删除凭据文件，不是解除禁用。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')},'确认永久删除该凭证？\n'+id+'\n失败类型='+cls+'\n仅配置中的可删失败类型会执行删除（默认 permission）。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个账号')}
+    function deleteOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'delete',auth_id:id},'确认永久删除该 403 账号？\n'+id+'\n\n此操作会从 CPA 删除凭据文件，不是解除禁用。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
     function deleteSelected403(){const selected=state.bans.filter(x=>state.selected.has(x.auth_id)&&x.status_code===403);if(!selected.length){setMessage('没有已选的 403 账号',true);return}const ids=selected.map(x=>x.auth_id);runAction({op:'delete-many',auth_ids:ids.join(',')},'确认永久删除已选 '+ids.length+' 个 403 账号？\n此操作会从 CPA 删除凭据文件，不是解除禁用。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
     function deleteAll403(){const n=state.bans.filter(x=>x.status_code===403).length;runAction({op:'delete-403'},'确认永久删除全部 '+n+' 个 403 账号？\n此操作会从 CPA 删除凭据文件，不是解除禁用，且不可恢复。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
     async function copyVisible(){const ids=filtered().map(x=>x.auth_id).join('\n');try{await navigator.clipboard.writeText(ids);setMessage('已复制 '+filtered().length+' 个 Auth ID')}catch(_){setMessage('浏览器拒绝访问剪贴板',true)}}
