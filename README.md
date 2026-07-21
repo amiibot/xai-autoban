@@ -90,7 +90,7 @@ plugins:
   enabled: true
   dir: "plugins"
   store-sources:
-    - "https://raw.githubusercontent.com/vrxiaojie/xai-autoban/main/registry.json"
+    - "https://raw.githubusercontent.com/amiibot/xai-autoban/main/registry.json"
   configs:
     xai-autoban:
       enabled: true
