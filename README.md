@@ -1,31 +1,48 @@
 # xai-autoban
 
-`xai-autoban` 是一个 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 原生插件，用于自动隔离持续返回错误的 xAI OAuth 凭据，避免 CPA 在大号池中逐个重试无效账号而显著拉长首 token 时间。
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 原生插件：在 xAI 凭据返回 `401/402/403/429` 时自动隔离，避免 CPA 在大号池里逐个重试坏号、拖长首 token。
 
-## 功能
+本仓库为 [vrxiaojie/xai-autoban](https://github.com/vrxiaojie/xai-autoban) 的 fork（amiibot），当前版本 **1.3.6**。
 
-| 上游状态 | 默认处理 |
+| | |
 | --- | --- |
-| `401` | 通过 Management API 停用 24 小时 |
-| `402` | 通过 Management API 停用 24 小时 |
-| `403` | 通过 Management API 停用 24 小时 |
-| `429` | 通过 Management API 停用 24 小时（默认；可用 class 覆盖） |
+| 插件 id / 文件名 | `xai-autoban` |
+| 商店 registry | https://raw.githubusercontent.com/amiibot/xai-autoban/main/registry.json |
+| Latest Release | https://github.com/amiibot/xai-autoban/releases/latest |
 
-### 细分类（v1.1，本 fork）
+---
 
-失败时解析 `UsageFailure.Body`，将账号归入 class，并按 class 决定隔离时长与是否允许永久删除：
+## 功能概览
 
-| Class | 典型信号 | 默认隔离 | 默认可永久删除 |
-| --- | --- | --- | --- |
-| `auth` | 401；403 body 含 invalid/expired token | 24h | 否 |
-| `payment` | 402 | 24h | 否 |
-| `quota_paid` | spending-limit 等 | 24h | 否 |
-| `quota_free` | free-usage-exhausted 等 | 24h | 否 |
-| `permission` | permission-denied / chat endpoint denied | 24h | **是** |
-| `rate_limit` | 429 | 24h | 否 |
-| `forbidden_unknown` | 其它 403 | 24h | 否 |
+| 能力 | 说明 |
+| --- | --- |
+| 调度隔离 | Usage 失败后立即从调度候选中跳过该凭据 |
+| Management 停用 | 后台 `PATCH` CPA 将 auth 标为 disabled；到期再启用 |
+| 失败类型（展示 + TTL） | 解析 body 粗分为 `auth` / `permission` / `quota_free` 等；可按类型配隔离时长 |
+| 永久删除 | **与原版一致：仅 HTTP 403**（删凭据文件，不是解禁） |
+| 用量观测 | 内嵌只读 CPAMP `usage.sqlite` 近 24h token；**不预 ban** |
+| 面板 | 统计、圆饼图、搜索筛选、解禁 / 删 403 |
 
-配置示例：
+只处理 `provider=xai`，不影响 Codex / Claude / Gemini 等。
+
+---
+
+## 隔离与失败类型
+
+默认触发状态码：`401`、`402`、`403`、`429`。默认隔离 **24 小时**（`disable-hours` / `class-disable-hours` 可改）。
+
+| 失败类型 | 典型信号 | 默认隔离 |
+| --- | --- | --- |
+| `auth` | 401；403 body 含 invalid/expired token | 24h |
+| `payment` | 402 | 24h |
+| `quota_paid` | spending-limit 等 | 24h |
+| `quota_free` | free-usage-exhausted 等 | 24h |
+| `permission` | permission-denied / chat endpoint denied | 24h |
+| `rate_limit` | 429 | 24h |
+| `forbidden_unknown` | 其它 403 | 24h |
+
+失败类型用于**面板展示**和**按类调整 TTL**。  
+**永久删除不看失败类型，只看状态码是否为 403**（上游原版行为）。
 
 ```yaml
 plugins:
@@ -35,55 +52,56 @@ plugins:
       disable-hours: 24
       classify-body: true
       # class-disable-hours:
-      #   rate_limit: 24
+      #   rate_limit: 12
       #   permission: 48
-      deletable-classes: [permission]   # 可追加如 quota_free
 ```
 
-- 面板支持按 Class 展示；永久删除仅 `deletable-classes`（默认只有 `permission`），也可多选 class 批量删除。
-- 插件 id / 文件名仍为 `xai-autoban`，与 CPA 原安装路径兼容。
+---
 
-### 用量观测与圆饼图（v1.3，内嵌）
+## 永久删除（403）
 
-- **单插件**：v1.3 起直接只读 CPAMP `usage.sqlite` 汇总近 24h token，**不再依赖**并排安装 grok-quota。
-- **不预 ban**：不会因为用量高或额度日志标记而自动隔离（隔离仍只看 401/402/403/429 等实时失败 + class TTL）。
-- 面板为隔离行附加只读 `tokens_24h`；圆饼图含**正常** + 401/402/403/429 与 class。
-- 池规模优先 Management 列表，其次 usage 观测池。
-- 路径探测：`usage-db-path` / `XAI_AUTOBAN_USAGE_DB` / `CPAMP_USAGE_DB` / 常见 `CPAMP/data/usage.sqlite`、`data/usage.sqlite`。
-- 可选回退：`join-quota-state` + `quota-state-file` 仍可读外部 `grok-quota-state.json`（sqlite 找不到时）。
+| 操作 | 行为 |
+| --- | --- |
+| 行内「删除账号」 | 仅该行 `status_code === 403` |
+| 「删除已选 403」 | 勾选中的 403 |
+| 「删除全部 403 账号」 | 当前隔离列表里全部 403 |
 
+调用 Management API **删除凭据文件**，不会重新启用。勾选主要用于「解禁已选」；删除也可对已选 403 批量执行。
 
-- 只处理 `xai` provider，不影响 Codex、Claude、Gemini 等其他凭据。
-- 错误发生后立即在 CPA 调度阶段跳过该凭据，后台再调用网页 Management API 真正停用账号。
-- 24 小时到期后调用 Management API 重新启用账号；失败时自动重试。
-- 状态落盘，CPA 重启后仍会继续执行未完成的停用和恢复任务。
-- Management Key 错误时启用全局冷却，避免连续错误请求触发 CPA 的管理接口 IP 封禁。
-- 可通过 `status-codes` 自定义触发停用的 HTTP 状态码。
-- 提供实时统计、搜索、筛选、分页和批量解禁界面。
-- 支持单个、选中项、按状态码和全部解禁。
-- 支持对 **可删 class**（默认 `permission`）永久删除；可配置 `deletable-classes` 勾选多种 class（调用 Management API 删除凭据文件，不是解除禁用）。
-- 保留带 CPA 管理密钥保护的 Management API。
+---
 
-## 构建
+## 用量观测与圆饼图（v1.3+）
 
-构建脚本使用官方 Debian Go 镜像，需要 Docker，并会运行测试后分别编译 Linux arm64 和 amd64：
+- **单插件**：直接读 CPAMP / Usage 的 `usage.sqlite`，不依赖并排安装 grok-quota。
+- **不预 ban**：用量高或额度日志**不会**触发隔离；隔离只看实时 401/402/403/429。
+- 隔离行「24h用量 / 上限」显示如 `1.20M / 2.00M`（无 ok/cooldown 文案）。
+- **池规模**：优先 Management 列出的 xAI 凭证总数；Management 失败时退化为 usage 中出现过的账号数。
+- 路径：`usage-db-path` / 环境变量 `XAI_AUTOBAN_USAGE_DB`、`CPAMP_USAGE_DB`，或自动探测 `data/usage.sqlite` 等。
+- 可选回退：`join-quota-state` + 外部 `grok-quota-state.json`。
 
-```bash
-bash build.sh
-```
+---
 
-产物：
+## 面板列说明
 
-```text
-dist/xai-autoban-linux-arm64.so
-dist/xai-autoban-linux-amd64.so
-```
+| 列 | 含义 |
+| --- | --- |
+| 状态码 | HTTP 401/402/403/429 |
+| 失败类型 | body 粗分类（仅展示 / TTL） |
+| 24h用量 / 上限 | 观测用 token，不决策 |
+| 原因 | 简短 reason |
+| 当前处置 | CPA 停用/恢复进度：等待停用 / 已停用 / 恢复中 / 停用重试中 / 恢复重试中 |
+| 隔离时间 / 自动解禁 / 剩余时间 | 原版即有：开始隔离、计划解禁、剩余时长 |
+
+菜单：管理中心 → **xAI Autoban**  
+资源：`/v0/resource/plugins/xai-autoban/status`、`/data`
+
+---
 
 ## 安装
 
-### 推荐：通过 CPA 插件商店安装
+### 商店（推荐）
 
-在 CPA 的 `config.yaml` 中把本仓库的 `registry.json` 添加为插件商店源：
+**请使用本 fork 的 registry**（上游仍为 1.0.4）：
 
 ```yaml
 plugins:
@@ -95,122 +113,130 @@ plugins:
     xai-autoban:
       enabled: true
       priority: 200
-      management-url: http://127.0.0.1:8317
+      # 必须与 CPA 实际监听端口一致（默认文档常写 8317，自建可能是 19999）
+      management-url: http://127.0.0.1:19999
       management-key-env: CPA_MANAGEMENT_KEY
       disable-hours: 24
       status-codes: [401, 402, 403, 429]
       state-file: data/xai-autoban-state.json
+      observe-usage: true
+      usage-db-path: /data/usage.sqlite   # 容器内路径示例；按部署调整
 ```
 
-保存配置并重启 CPA 后，打开 **管理中心 → 插件商店**，找到 **xAI Autoban** 并点击安装。商店会根据 CPA 所在平台自动下载对应的 GitHub Release ZIP。
+商店依赖访问 GitHub；API 限流时可改用下方手动安装。
 
-商店安装依赖 CPA 能访问 `raw.githubusercontent.com`、`api.github.com` 和 GitHub Release 下载地址。Release 资产支持：
+Release ZIP（根目录仅一个二进制）：
 
-| 平台 | Release 资产 |
+| 平台 | 资产名（当前以 linux_amd64 公开发布为主） |
 | --- | --- |
-| Windows x86_64 | `xai-autoban_{version}_windows_amd64.zip` |
 | Linux x86_64 | `xai-autoban_{version}_linux_amd64.zip` |
-| Linux ARM64 | `xai-autoban_{version}_linux_arm64.zip` |
-| macOS Intel | `xai-autoban_{version}_darwin_amd64.zip` |
-| macOS Apple Silicon | `xai-autoban_{version}_darwin_arm64.zip` |
-
-每个 ZIP 的根目录都只包含平台对应的 `xai-autoban.so`、`xai-autoban.dll` 或 `xai-autoban.dylib`，Release 同时提供 `checksums.txt` 供 CPA 校验。
 
 ### 手动安装
 
-下载与服务器架构对应的文件后，必须将文件名改为 `xai-autoban.so`，再复制到 CPA 插件目录：
-
 ```text
-amd64: plugins/linux/amd64/xai-autoban.so
-arm64: plugins/linux/arm64/xai-autoban.so
+plugins/linux/amd64/xai-autoban.so
 ```
-
-CPA 必须启用 Management API，并配置管理密钥：
 
 ```yaml
 remote-management:
   secret-key: "你的管理密钥"
+  allow-remote: true   # 若 Management 来自其它容器/主机
 ```
 
-### 配置方式
-
-安装插件后，可以通过下面两种方式完成启用与参数配置，任选其一即可。
-
-| 方式 | 适用场景 |
-| --- | --- |
-| 编辑 `config.yaml` | 适合批量部署、脚本化运维、需要配置完整高级参数 |
-| CPA 插件管理界面 | 适合已在管理后台操作，不想改配置文件 |
-
-两种方式使用的是同一套插件配置字段；保存后由 CPA 加载并交给本插件解析。若你同时改了文件和管理界面，请以当前 CPA 版本的最终生效配置为准。
-
-#### 方式一：编辑 `config.yaml`
-
-在 CPA 的 `config.yaml` 中启用并配置插件：
+compose 需挂载插件目录与（可选）usage 库，例如：
 
 ```yaml
-plugins:
-  enabled: true
-  configs:
-  # 插件名称需要和安装后的 .so 文件名一致
-    xai-autoban:
-      enabled: true
-      priority: 200
-      management-url: http://127.0.0.1:8317
-      management-key-env: 你的管理密钥 # secret-key
-      disable-hours: 24
-      status-codes: [401, 402, 403, 429]
-      request-timeout-seconds: 10
-      retry-interval-seconds: 60
-      auth-failure-cooldown-seconds: 600
-      state-file: data/xai-autoban-state.json
+volumes:
+  - ./plugins:/CLIProxyAPI/plugins
+  - ./cpamp-data:/data:ro    # 内含 usage.sqlite
 ```
 
-也可以使用 `management-key` 直接配置密钥，但不建议把明文密钥提交到 Git。`state-file` 所在目录必须允许 CPA 进程写入。
+### 配置字段摘要
 
-#### 方式二：在 CPA 插件管理中配置
+| 字段 | 说明 |
+| --- | --- |
+| `management-url` | CPA 根地址，**端口必须正确** |
+| `management-key` / `management-key-env` | Management 密钥 |
+| `disable-hours` | 默认隔离小时数 |
+| `class-disable-hours` | 按失败类型覆盖 TTL |
+| `status-codes` | 触发隔离的 HTTP 状态码 |
+| `classify-body` | 是否解析 body 做失败类型（默认 true） |
+| `state-file` | 隔离状态落盘路径 |
+| `observe-usage` | 是否读 usage.sqlite（默认 true） |
+| `usage-db-path` | sqlite 绝对路径 |
+| `auth-dir` | 可选，邮箱 enrich |
 
-1. 将 `.so` 安装到对应架构目录后，启动或重启 CLIProxyAPI，确认插件已加载。
-2. 打开 CPA 管理后台中的插件管理页面。
-3. 找到 `xai-autoban`，在表单中填写配置并保存。插件会声明常用字段，例如：
-   - `management-url`
-   - `management-key` / `management-key-env`
-   - `disable-hours`
-   - `status-codes`
-   - `state-file`
-4. 如需 `request-timeout-seconds`、`retry-interval-seconds`、`auth-failure-cooldown-seconds` 等高级项，可在 `config.yaml` 中补充；`enabled`、`priority` 等宿主级开关也以 CPA 插件管理或 `config.yaml` 中的插件宿主配置为准。
-5. 保存后如 CPA 要求，再重启一次使配置生效。
-
-重启 CLIProxyAPI 后，日志应包含：
+日志示例：
 
 ```text
-pluginhost: plugin registered plugin_id=xai-autoban plugin_name=xai-autoban version=1.1.0
+pluginhost: plugin registered plugin_id=xai-autoban plugin_name=xai-autoban version=1.3.6
 ```
 
-## 管理面板
-带 CPA 管理鉴权的兼容 API：
+---
+
+## Management API（需鉴权）
 
 ```text
 GET  /v0/management/plugins/xai-autoban/bans
 POST /v0/management/plugins/xai-autoban/unban
 POST /v0/management/plugins/xai-autoban/unban-all
-POST /v0/management/plugins/xai-autoban/delete
-POST /v0/management/plugins/xai-autoban/delete-403
+POST /v0/management/plugins/xai-autoban/delete        # 单条 403
+POST /v0/management/plugins/xai-autoban/delete-403    # 全部 403
 POST /v0/management/plugins/xai-autoban/import
 ```
 
-## 状态说明
+公开资源（面板，无需 Management Key）：
 
-- 插件只会自动恢复由自己成功停用并记录的账号。
-- `401`、`402`、`403`、`429` 默认在首次错误后按 class 隔离 24 小时；可用 `disable-hours` / `class-disable-hours` 调整。
-- 凭据修复、充值或恢复订阅后，可从面板手动解禁，无需等待到期。
-- 插件仅处理已经被请求命中的错误凭据，不会主动扫描整个账号池。
-- 如果所有候选凭据都被插件隔离，最终行为交由 CPA 自带调度器决定。
-- Management API 暂时不可用时，本地调度隔离仍然生效；面板会显示停用或恢复重试状态。
+```text
+GET /v0/resource/plugins/xai-autoban/status
+GET /v0/resource/plugins/xai-autoban/data
+GET /v0/resource/plugins/xai-autoban/action?...
+```
+
+---
+
+## 构建
+
+```bash
+# 需 CGO；本地示例（linux/amd64）
+CGO_ENABLED=1 go build -buildmode=c-shared -o dist/xai-autoban.so .
+
+# 或 Docker 多架构（若环境有 docker）
+bash build.sh
+```
+
+商店兼容包：ZIP 内根目录仅 `xai-autoban.so`，命名  
+`xai-autoban_{version}_linux_amd64.zip`。
+
+---
+
+## 行为说明
+
+- 仅自动恢复**本插件成功停用并记入 state** 的账号。
+- 不会主动扫全池；只处理已被请求打到的错误凭据。
+- Management 暂时不可用时，本地调度隔离仍生效；「当前处置」会显示停用/恢复重试。
+- 全部候选都被隔离时，最终行为由 CPA 自带调度决定。
+
+---
+
+## 版本摘要
+
+| 版本 | 要点 |
+| --- | --- |
+| 1.3.6 | 修复面板 JS 损坏导致一直「正在连接」 |
+| 1.3.5 | 永久删除恢复为仅 403；24h 列去掉状态词 |
+| 1.3.x | 内嵌 usage.sqlite 观测、圆饼图含正常号 |
+| 1.2.x | 失败类型展示与 class TTL |
+| 1.1+ | 本 fork 分类与面板增强 |
+| 上游 | 调度隔离 + 403 永久删除基线 |
+
+---
 
 ## 致谢
 
-- 本项目基于 [akihitohyh/xai-autoban](https://github.com/akihitohyh/xai-autoban)，并参考 [ysxk/codex-429-autoban](https://github.com/ysxk/codex-429-autoban) 的 CPA 插件 ABI 实现思路。
-- 感谢 [linux.do](https://linux.do) 社区的讨论、反馈与支持。
+- 上游与 CPA 插件生态：[vrxiaojie/xai-autoban](https://github.com/vrxiaojie/xai-autoban)、[akihitohyh/xai-autoban](https://github.com/akihitohyh/xai-autoban)、[ysxk/codex-429-autoban](https://github.com/ysxk/codex-429-autoban)
+- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) / CPAMP 用量库
+- [linux.do](https://linux.do) 社区
 
 ## License
 
