@@ -47,11 +47,26 @@ type runtimeConfig struct {
 	// JoinQuotaState allows falling back to an external state file when
 	// ObserveUsage fails or is disabled. Default true (soft fallback only).
 	JoinQuotaState bool
-	// ClassDisableHours maps failure class → isolation duration.
-	// Missing classes fall back to DisableDuration.
+	// ClassDisableHours maps failure class → isolation duration cap.
+	// Missing classes fall back to DisableDuration. Stepped cooldowns are min(step, cap).
 	ClassDisableHours map[string]time.Duration
 	// DeletableClasses are the only classes allowed for permanent Management delete.
+	// Note: permanent delete is HTTP 403 ops in the controller; this set is retained for config/API.
 	DeletableClasses map[string]struct{}
+
+	// Debt / half-open policy (see policy.go). Hard isolation is never permanent by itself.
+	DebtEnabled              bool
+	DebtThreshold            float64
+	DebtSuccessDecay         float64
+	DebtFail401              float64 // default weight for most classes
+	DebtFail429              float64 // default weight for rate_limit
+	DebtWeights              map[string]float64
+	StreakThreshold          int
+	OneShotClasses           map[string]struct{} // e.g. permission → isolate on first failure (still with TTL)
+	CooldownSteps             []time.Duration    // 6h, 12h, 24h
+	HalfOpenEnabled          bool
+	HalfOpenSuccessThreshold int
+	TrialMaxDuration         time.Duration
 }
 
 type rawRuntimeConfig struct {
@@ -73,6 +88,17 @@ type rawRuntimeConfig struct {
 	JoinQuotaState             *bool              `yaml:"join-quota-state"`
 	ClassDisableHours          map[string]float64 `yaml:"class-disable-hours"`
 	DeletableClasses           []string           `yaml:"deletable-classes"`
+	DebtEnabled                *bool              `yaml:"debt-enabled"`
+	DebtThreshold              *float64           `yaml:"debt-threshold"`
+	DebtSuccessDecay           *float64           `yaml:"debt-success-decay"`
+	DebtFail401                *float64           `yaml:"debt-fail-401"`
+	DebtFail429                *float64           `yaml:"debt-fail-429"`
+	StreakThreshold            *int               `yaml:"streak-threshold"`
+	OneShotClasses             []string           `yaml:"one-shot-classes"`
+	CooldownHours               []float64          `yaml:"cooldown-hours"`
+	HalfOpenEnabled            *bool              `yaml:"half-open-enabled"`
+	HalfOpenSuccessThreshold   *int               `yaml:"half-open-success-threshold"`
+	TrialMaxHours              *float64           `yaml:"trial-max-hours"`
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -89,10 +115,23 @@ func defaultRuntimeConfig() runtimeConfig {
 		ClassifyBody:        true,
 		ObserveUsage:        true,
 		JoinQuotaState:      true, // file fallback only when sqlite observe fails
-		// Defaults: all tracked failures isolate 24h (free 429 window / auth recovery window).
+		// Cap for stepped isolation (actual spell = min(step ladder, class cap)).
 		ClassDisableHours: defaultClassDisableHours(defaultDisableHours * time.Hour),
-		// Permanent delete only for hard permission denials by default; more classes can be enabled.
+		// Config surface only; runtime permanent delete is HTTP 403 (not class-gated).
 		DeletableClasses: stringSet([]string{classPermission}),
+
+		DebtEnabled:              true,
+		DebtThreshold:            2.0,
+		DebtSuccessDecay:         1.0,
+		DebtFail401:              1.5,
+		DebtFail429:              0.5,
+		DebtWeights:              defaultDebtWeights(),
+		StreakThreshold:          3,
+		OneShotClasses:           defaultOneShotClasses(), // permission: first hit → hard isolate with TTL
+		CooldownSteps:             defaultCooldownSteps(),
+		HalfOpenEnabled:          true,
+		HalfOpenSuccessThreshold: 2,
+		TrialMaxDuration:         6 * time.Hour,
 	}
 }
 
@@ -189,6 +228,53 @@ func parseRuntimeConfig(raw []byte) (runtimeConfig, error) {
 	if input.DeletableClasses != nil {
 		// Explicit empty list means nothing is permanently deletable.
 		cfg.DeletableClasses = stringSet(input.DeletableClasses)
+	}
+	if input.DebtEnabled != nil {
+		cfg.DebtEnabled = *input.DebtEnabled
+	}
+	if input.DebtThreshold != nil && *input.DebtThreshold > 0 {
+		cfg.DebtThreshold = *input.DebtThreshold
+	}
+	if input.DebtSuccessDecay != nil && *input.DebtSuccessDecay >= 0 {
+		cfg.DebtSuccessDecay = *input.DebtSuccessDecay
+	}
+	if input.DebtFail401 != nil && *input.DebtFail401 >= 0 {
+		cfg.DebtFail401 = *input.DebtFail401
+	}
+	if input.DebtFail429 != nil && *input.DebtFail429 >= 0 {
+		cfg.DebtFail429 = *input.DebtFail429
+	}
+	// Keep class weight map coherent with scalar defaults / overrides.
+	cfg.DebtWeights = defaultDebtWeights()
+	cfg.DebtWeights[classRateLimit] = cfg.DebtFail429
+	for _, cname := range []string{classAuth, classPayment, classQuotaFree, classQuotaPaid, classPermission, classLegacy} {
+		cfg.DebtWeights[cname] = cfg.DebtFail401
+	}
+	if input.StreakThreshold != nil && *input.StreakThreshold > 0 {
+		cfg.StreakThreshold = *input.StreakThreshold
+	}
+	if input.OneShotClasses != nil {
+		cfg.OneShotClasses = stringSet(input.OneShotClasses)
+	}
+	if len(input.CooldownHours) > 0 {
+		steps := make([]time.Duration, 0, len(input.CooldownHours))
+		for _, h := range input.CooldownHours {
+			if h > 0 {
+				steps = append(steps, time.Duration(h*float64(time.Hour)))
+			}
+		}
+		if len(steps) > 0 {
+			cfg.CooldownSteps = steps
+		}
+	}
+	if input.HalfOpenEnabled != nil {
+		cfg.HalfOpenEnabled = *input.HalfOpenEnabled
+	}
+	if input.HalfOpenSuccessThreshold != nil && *input.HalfOpenSuccessThreshold > 0 {
+		cfg.HalfOpenSuccessThreshold = *input.HalfOpenSuccessThreshold
+	}
+	if input.TrialMaxHours != nil && *input.TrialMaxHours > 0 {
+		cfg.TrialMaxDuration = time.Duration(*input.TrialMaxHours * float64(time.Hour))
 	}
 	return cfg, nil
 }

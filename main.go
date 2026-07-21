@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.3.6"
+	pluginVersion = "1.4.0"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -155,10 +155,16 @@ func pluginRegistration() registration {
 				{Name: "management-url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management-key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA Management Key；优先于环境变量。"},
 				{Name: "management-key-env", Type: pluginapi.ConfigFieldTypeString, Description: "Management Key 环境变量名，默认 CPA_MANAGEMENT_KEY。"},
-				{Name: "disable-hours", Type: pluginapi.ConfigFieldTypeInteger, Description: "错误账号停用时长，默认 24 小时。"},
-				{Name: "status-codes", Type: pluginapi.ConfigFieldTypeArray, Description: "触发停用的 HTTP 状态码，默认 401、402、403、429。"},
+				{Name: "disable-hours", Type: pluginapi.ConfigFieldTypeInteger, Description: "隔离时长上限（小时），默认 24；实际隔离取阶梯冷却与该上限的较小值。"},
+				{Name: "status-codes", Type: pluginapi.ConfigFieldTypeArray, Description: "触发证据/隔离的 HTTP 状态码，默认 401、402、403、429。"},
 				{Name: "state-file", Type: pluginapi.ConfigFieldTypeString, Description: "自动恢复状态文件，默认 xai-autoban-state.json。"},
 				{Name: "classify-body", Type: pluginapi.ConfigFieldTypeString, Description: "是否解析失败 body 做细分类，默认 true。"},
+				{Name: "debt-enabled", Type: pluginapi.ConfigFieldTypeString, Description: "是否启用失败债务累计，默认 true（permission 仍一次硬隔离但带 TTL）。"},
+				{Name: "debt-threshold", Type: pluginapi.ConfigFieldTypeString, Description: "债务达到此值触发硬隔离，默认 2.0。"},
+				{Name: "streak-threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "归因连败次数触发硬隔离，默认 3。"},
+				{Name: "half-open-enabled", Type: pluginapi.ConfigFieldTypeString, Description: "到期后是否进入半开试用，默认 true。"},
+				{Name: "half-open-success-threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "试用成功次数毕业，默认 2。"},
+				{Name: "cooldown-hours", Type: pluginapi.ConfigFieldTypeArray, Description: "阶梯冷却小时列表，默认 [6,12,24]。"},
 				
 				{Name: "observe-usage", Type: pluginapi.ConfigFieldTypeString, Description: "是否内嵌读取 CPAMP usage.sqlite 做 24h 用量观测，默认 true（不依赖 grok-quota）。"},
 				{Name: "usage-db-path", Type: pluginapi.ConfigFieldTypeString, Description: "usage.sqlite 路径；空则自动探测。"},
@@ -176,7 +182,8 @@ func handleUsage(raw []byte) ([]byte, error) {
 	if len(raw) == 0 || json.Unmarshal(raw, &record) != nil {
 		return okEnvelope(map[string]any{})
 	}
-	if !strings.EqualFold(record.Provider, providerXAI) || !record.Failed {
+	// Success events needed for debt decay + half-open graduation.
+	if record.Provider != "" && !strings.EqualFold(record.Provider, providerXAI) {
 		return okEnvelope(map[string]any{})
 	}
 	if record.AuthID == "" {
@@ -451,7 +458,12 @@ type banInfo struct {
 	RemainingSeconds   int64  `json:"remaining_seconds"`
 	ManagementDisabled bool   `json:"management_disabled"`
 	Deletable          bool   `json:"deletable"`
-	LastError          string `json:"last_error,omitempty"`
+	LastError          string  `json:"last_error,omitempty"`
+	Phase              string  `json:"phase,omitempty"`
+	Step               int     `json:"step,omitempty"`
+	DebtScore          float64 `json:"debt_score,omitempty"`
+	Streak             int     `json:"streak,omitempty"`
+	TrialSuccesses     int     `json:"trial_successes,omitempty"`
 	// Optional rolling-24h usage join (observe only; never pre-ban).
 	Tokens24h   int64  `json:"tokens_24h"`
 	QuotaLimit  int64  `json:"quota_limit,omitempty"`
@@ -508,6 +520,8 @@ func currentStatus() statusInfo {
 			BodyFingerprint: entry.BodyFingerprint, BannedAt: entry.BannedAt.Format(time.RFC3339),
 			ResetAt: entry.ResetAt.Format(time.RFC3339), RemainingSeconds: remaining,
 			ManagementDisabled: entry.ManagementDisabled, Deletable: entry.StatusCode == 403, LastError: entry.LastError,
+				Phase: normalizePhase(entry.Phase), Step: entry.Step, DebtScore: entry.DebtScore, Streak: entry.Streak,
+				TrialSuccesses: entry.TrialSuccesses,
 		}
 		if qidx.OK {
 			if q, ok := qidx.lookup(id, entry.AuthIndex, ""); ok {
@@ -793,7 +807,7 @@ func statusPage() string {
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。解除操作会立即影响 xAI 凭据调度。「失败类型」= 上游失败分类（仅展示）；「当前处置」= 是否已在 CPA 停用/恢复。永久删除仅针对状态码 403（删除凭据文件，不是解禁）。勾选用于解禁已选，或删除已选中的 403。</p>
+    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「失败类型」= 上游分类；「当前处置」= 停用进度或试用中。permission 一次即硬隔离但仍可到期试用。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
@@ -808,7 +822,7 @@ func statusPage() string {
     function formatDate(value){const d=new Date(value);return Number.isNaN(d.getTime())?value:d.toLocaleString('zh-CN',{hour12:false})}
     function formatRemaining(seconds){seconds=Math.max(0,Number(seconds||0));const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);if(d)return d+'天 '+h+'小时';if(h)return h+'小时 '+m+'分';return m+'分钟'}
     function reasonLabel(reason){return {payment_required:'无额度或无订阅',forbidden:'上游拒绝访问',unauthorized:'凭据未授权',rate_limited:'请求频率受限',rate_limited_fallback:'限流（默认冷却）'}[reason]||reason}
-    function managementState(ban){if(ban.last_error)return {label:ban.management_disabled?'恢复重试中':'停用重试中',className:'management-error',title:ban.last_error};if(ban.management_disabled)return {label:Number(ban.remaining_seconds)>0?'已停用':'恢复中',className:Number(ban.remaining_seconds)>0?'management-ok':'management-pending',title:''};return {label:'等待停用',className:'management-pending',title:''}}
+    function managementState(ban){if(ban.phase==='trial'){const t=ban.trial_successes||0;return {label:'试用中('+t+')',className:'management-pending',title:'半开试用，成功次数 '+t}};if(ban.last_error)return {label:ban.management_disabled?'恢复重试中':'停用重试中',className:'management-error',title:ban.last_error};if(ban.management_disabled)return {label:Number(ban.remaining_seconds)>0?'已停用':'恢复中',className:Number(ban.remaining_seconds)>0?'management-ok':'management-pending',title:''};return {label:'等待停用',className:'management-pending',title:''}}
 
     async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
 

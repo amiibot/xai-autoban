@@ -31,6 +31,7 @@ func TestParseRuntimeConfig(t *testing.T) {
 func TestDefaultRuntimeConfigQueues429(t *testing.T) {
 	state := newBanState()
 	controller := newAutobanController(state)
+	// Single rate_limit only accumulates debt (0.5); does not isolate until threshold.
 	controller.handleUsage(pluginapi.UsageRecord{
 		Provider:  "xai",
 		AuthID:    "rate-limited-auth",
@@ -38,15 +39,34 @@ func TestDefaultRuntimeConfigQueues429(t *testing.T) {
 		Failed:    true,
 		Failure:   pluginapi.UsageFailure{StatusCode: http.StatusTooManyRequests},
 	})
-
+	state.mu.Lock()
+	_, ok := state.bans["rate-limited-auth"]
+	ev := state.evidence["rate-limited-auth"]
+	state.mu.Unlock()
+	if ok {
+		t.Fatal("single 429 should not isolate under debt policy")
+	}
+	if ev.DebtScore < 0.4 || ev.Streak != 1 {
+		t.Fatalf("expected debt/streak evidence, got %#v", ev)
+	}
+	// Streak threshold 3 → third consecutive 429 isolates.
+	for i := 0; i < 2; i++ {
+		controller.handleUsage(pluginapi.UsageRecord{
+			Provider: "xai", AuthID: "rate-limited-auth", AuthIndex: "idx-429",
+			Failed: true, Failure: pluginapi.UsageFailure{StatusCode: http.StatusTooManyRequests},
+		})
+	}
 	state.mu.Lock()
 	entry, ok := state.bans["rate-limited-auth"]
 	state.mu.Unlock()
 	if !ok {
-		t.Fatal("429 response should queue the credential for disabling by default")
+		t.Fatal("streak threshold should isolate after repeated 429")
 	}
 	if entry.StatusCode != http.StatusTooManyRequests || entry.Reason != "rate_limited" {
 		t.Fatalf("unexpected 429 ban entry: %#v", entry)
+	}
+	if entry.Phase != phaseIsolated {
+		t.Fatalf("phase=%s", entry.Phase)
 	}
 }
 
@@ -219,11 +239,12 @@ func TestControllerDisablesAndReenablesAfterExpiry(t *testing.T) {
 	state := newBanState()
 	controller := newAutobanController(state)
 	t.Cleanup(controller.shutdown)
-	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nstate-file: " + filepath.Join(t.TempDir(), "state.json") + "\n"
+	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nhalf-open-enabled: false\nstate-file: " + filepath.Join(t.TempDir(), "state.json") + "\n"
 	if err := controller.configure([]byte(configYAML)); err != nil {
 		t.Fatal(err)
 	}
-	controller.handleUsage(pluginapi.UsageRecord{Provider: "xai", AuthID: "xai-auth", AuthIndex: "idx", Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 401}})
+	// permission one-shot → isolate immediately; half-open off → drop after re-enable
+	controller.handleUsage(pluginapi.UsageRecord{Provider: "xai", AuthID: "xai-auth", AuthIndex: "idx", Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 403, Body: "permission-denied"}})
 	waitFor(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
@@ -255,7 +276,7 @@ func TestStateReloadKeepsPendingReenable(t *testing.T) {
 	}
 	now := time.Now()
 	first.set("persisted-auth", banEntry{AuthIndex: "idx-persisted", StatusCode: 402, Reason: "payment_required", BannedAt: now, ResetAt: now.Add(time.Hour)})
-	first.finishAction(banAction{AuthID: "persisted-auth", AuthIndex: "idx-persisted", Disabled: true}, nil, now, time.Minute)
+	first.finishAction(banAction{AuthID: "persisted-auth", AuthIndex: "idx-persisted", Disabled: true}, nil, now, time.Minute, false, 0, 0)
 
 	second := newBanState()
 	if err := second.configure(stateFile); err != nil {

@@ -85,7 +85,7 @@ func (c *autobanController) clientSnapshot() *managementClient {
 
 func (c *autobanController) handleUsage(record pluginapi.UsageRecord) {
 	cfg := c.config()
-	if !cfg.Enabled || !record.Failed || record.AuthID == "" || !cfg.handlesStatus(record.Failure.StatusCode) {
+	if !cfg.Enabled || record.AuthID == "" {
 		return
 	}
 	// Only act on xAI provider records when provider is populated.
@@ -93,26 +93,47 @@ func (c *autobanController) handleUsage(record pluginapi.UsageRecord) {
 		return
 	}
 	now := time.Now()
-	cls := classifyFailure(record.Failure.StatusCode, record.Failure.Body, cfg.ClassifyBody)
-	duration := cfg.durationForClass(cls.Class)
-	entry := banEntry{
-		AuthIndex:       record.AuthIndex,
-		StatusCode:      record.Failure.StatusCode,
-		Class:           cls.Class,
-		Reason:          cls.Reason,
-		BodyFingerprint: cls.Fingerprint,
-		BannedAt:        now,
-		ResetAt:         now.Add(duration),
+
+	// Success path: debt decay + half-open trial progress (even when not failed).
+	if !record.Failed {
+		if graduated := c.state.applySuccess(record.AuthID, now, cfg); graduated {
+			slog.Info("xai-autoban: trial graduated to healthy", "auth_id", record.AuthID)
+		}
+		// Timed-out trials are re-isolated on the worker tick.
+		return
 	}
-	c.state.set(record.AuthID, entry)
-	slog.Warn("xai-autoban: credential queued for management disable",
+
+	if !cfg.handlesStatus(record.Failure.StatusCode) {
+		return
+	}
+
+	cls := classifyFailure(record.Failure.StatusCode, record.Failure.Body, cfg.ClassifyBody)
+	isolated, entered := c.state.applyFailure(record.AuthID, record.AuthIndex, record.Failure.StatusCode, cls, now, cfg)
+	if entered {
+		entry := c.state.lookup([]string{record.AuthID})[record.AuthID]
+		slog.Warn("xai-autoban: credential isolated (hard, time-bounded)",
+			"auth_id", record.AuthID,
+			"status", record.Failure.StatusCode,
+			"class", cls.Class,
+			"reason", cls.Reason,
+			"step", entry.Step,
+			"debt", entry.DebtScore,
+			"reset_at", entry.ResetAt.Format(time.RFC3339),
+		)
+		c.signal()
+		return
+	}
+	if isolated {
+		// Already isolated; evidence refreshed.
+		c.signal()
+		return
+	}
+	slog.Info("xai-autoban: failure recorded without isolation",
 		"auth_id", record.AuthID,
-		"status", entry.StatusCode,
-		"class", entry.Class,
-		"reason", entry.Reason,
-		"reset_at", entry.ResetAt.Format(time.RFC3339),
+		"status", record.Failure.StatusCode,
+		"class", cls.Class,
+		"reason", cls.Reason,
 	)
-	c.signal()
 }
 
 func (c *autobanController) requestRelease(authIDs []string) int {
@@ -164,6 +185,13 @@ func (c *autobanController) run() {
 
 func (c *autobanController) process() {
 	now := time.Now()
+	cfg := c.config()
+
+	// Half-open zombie trials → stepped re-isolation.
+	if n := c.state.reisolateTimedOutTrials(now, cfg); n > 0 {
+		slog.Warn("xai-autoban: re-isolated timed-out trial accounts", "count", n)
+	}
+
 	c.mu.RLock()
 	blockedUntil := c.blockedUntil
 	c.mu.RUnlock()
@@ -174,7 +202,7 @@ func (c *autobanController) process() {
 	actions := c.state.pendingActions(now)
 	for _, action := range actions {
 		c.mu.RLock()
-		cfg := c.cfg
+		cfg = c.cfg
 		client := c.client
 		blockedUntil = c.blockedUntil
 		c.mu.RUnlock()
@@ -195,7 +223,7 @@ func (c *autobanController) process() {
 			c.lastError = err.Error()
 			c.mu.Unlock()
 		}
-		c.state.finishAction(action, err, attemptedAt, retryInterval)
+		c.state.finishAction(action, err, attemptedAt, retryInterval, cfg.HalfOpenEnabled, cfg.TrialMaxDuration, cfg.HalfOpenSuccessThreshold)
 		if err != nil {
 			slog.Error("xai-autoban: management status update failed",
 				"auth_id", action.AuthID,
@@ -212,12 +240,13 @@ func (c *autobanController) process() {
 		c.mu.Unlock()
 		if action.Disabled {
 			slog.Warn("xai-autoban: credential disabled through Management API", "auth_id", action.AuthID)
+		} else if cfg.HalfOpenEnabled {
+			slog.Info("xai-autoban: credential re-enabled; entered half-open trial", "auth_id", action.AuthID)
 		} else {
 			slog.Info("xai-autoban: credential re-enabled through Management API", "auth_id", action.AuthID)
 		}
 	}
 }
-
 
 // deleteCredentials permanently removes auth files for the given IDs via Management API.
 // When statusCode > 0, only entries currently tracked with that HTTP status are deleted

@@ -77,11 +77,15 @@ func TestHandleUsageClassifiesAndSetsDuration(t *testing.T) {
 	if entry.StatusCode != 403 {
 		t.Fatalf("status=%d", entry.StatusCode)
 	}
-	// ~24h
-	if d := entry.ResetAt.Sub(entry.BannedAt); d < 23*time.Hour || d > 25*time.Hour {
-		t.Fatalf("duration %v", d)
+	// one-shot permission uses step-0 ladder (default 6h), not full 24h cap
+	if entry.Phase != phaseIsolated {
+		t.Fatalf("phase=%s", entry.Phase)
+	}
+	if d := entry.ResetAt.Sub(entry.BannedAt); d < 5*time.Hour || d > 7*time.Hour {
+		t.Fatalf("duration %v want ~6h", d)
 	}
 }
+
 
 // helper to avoid importing issues with package-level names in test file only
 func pluginapiUsage(status int, body, authID string) pluginapi.UsageRecord {
