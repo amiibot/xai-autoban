@@ -2,7 +2,7 @@
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 原生插件：在 xAI 凭据返回 `401/402/403/429` 时自动隔离，避免 CPA 在大号池里逐个重试坏号、拖长首 token。
 
-本仓库为 [vrxiaojie/xai-autoban](https://github.com/vrxiaojie/xai-autoban) 的 fork（amiibot），当前版本 **1.4.1**。
+本仓库为 [vrxiaojie/xai-autoban](https://github.com/vrxiaojie/xai-autoban) 的 fork（amiibot），当前版本 **1.4.2**。
 
 | | |
 | --- | --- |
@@ -89,10 +89,10 @@ plugins:
 | 失败类型 | body 粗分类（仅展示 / TTL） |
 | 24h用量 / 上限 | 观测用 token，不决策 |
 | 原因 | 简短 reason |
-| 当前处置 | CPA 停用/恢复进度：等待停用 / 已停用 / 恢复中 / 停用重试中 / 恢复重试中 / 试用中 |
+| 当前处置 | 本地/CPA 进度：隔离中·待停用 / 已停用 / 解禁中 / 半开试用 n/2 / 停用失败·重试 / 解禁失败·重试 |
 | 最后使用 | usage.sqlite 最近一次**成功**请求时间（跨 24h 窗口；只读） |
 | 已下线(h) | 本轮连续不可用起点至今的整小时数；阶梯再隔离 / 试用失败**不重置**；毕业或手动解禁清空 |
-| 隔离时间 / 自动解禁 / 剩余时间 | 本轮冷却开始、计划解禁、剩余时长（≠ 已下线起点） |
+| 剩余时间 | 本轮冷却剩余时长（hover 可看计划解禁时间；表中不再单独展示隔离开始/自动解禁） |
 
 菜单：管理中心 → **xAI Autoban**  
 资源：`/v0/resource/plugins/xai-autoban/status`、`/data`
@@ -171,7 +171,7 @@ volumes:
 日志示例：
 
 ```text
-pluginhost: plugin registered plugin_id=xai-autoban plugin_name=xai-autoban version=1.4.1
+pluginhost: plugin registered plugin_id=xai-autoban plugin_name=xai-autoban version=1.4.2
 ```
 
 ---
@@ -225,6 +225,7 @@ bash build.sh
 
 | 版本 | 要点 |
 | --- | --- |
+| 1.4.2 | 精简表列；当前处置文案澄清；悬停显示详情 |
 | 1.4.1 | 面板「最后使用」「已下线(h)」；state 记 unusable_since（阶梯不重置） |
 | 1.4.0 | 失败债务 + 阶梯冷却 + 半开试用；permission 一次硬隔离但非永 ban |
 | 1.3.6 | 修复面板 JS 损坏导致一直「正在连接」 |

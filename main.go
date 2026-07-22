@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.4.1"
+	pluginVersion = "1.4.2"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -406,12 +406,14 @@ type statusInfo struct {
 	// PoolTotal is xAI credentials known to the pie (banned + normal when available).
 	PoolTotal int `json:"pool_total"`
 	// NormalCount is currently not banned (and not disabled, when known).
-	NormalCount      int                  `json:"normal_count"`
-	DeletableClasses []string             `json:"deletable_classes"`
-	Charts           chartBundle          `json:"charts"`
-	QuotaJoin        quotaJoinInfo        `json:"quota_join"`
-	Management       managementStatusInfo `json:"management"`
-	Bans             []banInfo            `json:"bans"`
+	NormalCount      int      `json:"normal_count"`
+	DeletableClasses []string `json:"deletable_classes"`
+	// HalfOpenSuccessThreshold is the configured trial graduation count (panel label).
+	HalfOpenSuccessThreshold int                  `json:"half_open_success_threshold"`
+	Charts                   chartBundle          `json:"charts"`
+	QuotaJoin                quotaJoinInfo        `json:"quota_join"`
+	Management               managementStatusInfo `json:"management"`
+	Bans                     []banInfo            `json:"bans"`
 }
 
 type chartBundle struct {
@@ -595,10 +597,15 @@ func currentStatus() statusInfo {
 	if poolTotal < len(items) {
 		poolTotal = len(items)
 	}
+	threshold := cfg.HalfOpenSuccessThreshold
+	if threshold <= 0 {
+		threshold = 2
+	}
 	return statusInfo{
 		Plugin: pluginName, Version: pluginVersion, Count: len(items),
 		PoolTotal: poolTotal, NormalCount: normalCount,
-		DeletableClasses: []string{}, Charts: charts, QuotaJoin: qinfo,
+		DeletableClasses: []string{}, HalfOpenSuccessThreshold: threshold,
+		Charts: charts, QuotaJoin: qinfo,
 		Management: management, Bans: items,
 	}
 }
@@ -768,6 +775,10 @@ func statusPage() string {
     .toolbar{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);margin-bottom:14px}.toolbar-row{display:flex;align-items:center;gap:10px;padding:12px;flex-wrap:wrap}.toolbar-row+.toolbar-row{border-top:1px solid var(--line)}input[type=search]{height:36px;min-width:260px;flex:1;border:1px solid #bfc8d2;border-radius:6px;padding:0 11px;background:#fff;color:var(--text);font-size:14px}.segments{display:flex;border:1px solid #bfc8d2;border-radius:6px;overflow:hidden}.segments button{border:0;border-right:1px solid #bfc8d2;border-radius:0;background:#fff;color:#344054}.segments button:last-child{border-right:0}.segments button.active{background:#e8eef6;color:#101828;font-weight:700}
     button{height:36px;border:1px solid #bfc8d2;border-radius:6px;background:#fff;color:#273240;padding:0 12px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}button:hover{background:#f2f4f7}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.primary:hover{background:#164ca7}.danger{color:#b42318;border-color:#f1a39b;background:#fff}.danger:hover{background:var(--red-bg)}.quiet-danger{color:#b42318}.spacer{flex:1}.auto{display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.auto input{width:16px;height:16px}.message{min-height:20px;color:var(--muted);font-size:13px}.message.error{color:var(--red)}
     .table-shell{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);overflow:hidden}.table-head{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.table-head strong{font-size:14px}.table-head span{color:var(--muted);font-size:13px}.table-wrap{overflow:auto;max-height:64vh}table{border-collapse:collapse;width:100%;min-width:1280px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #edf0f3;vertical-align:middle}th{position:sticky;top:0;background:#f8fafb;color:#475467;font-size:12px;font-weight:700;z-index:1}tbody tr:hover{background:#f9fbfc}td code{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;color:#344054}.check{width:38px;text-align:center}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:24px;border-radius:12px;font-weight:750;font-size:12px}.b401{color:#175cd3;background:#eff8ff}.b402{color:var(--amber);background:var(--amber-bg)}.b403{color:var(--red);background:var(--red-bg)}.b429{color:#6941c6;background:#f4f3ff}.reason{color:#475467}.time{white-space:nowrap}.remaining{font-variant-numeric:tabular-nums;font-weight:650}.management-ok{color:var(--green);font-weight:650}.management-pending{color:var(--amber);font-weight:650}.management-error{color:var(--red);font-weight:650}.row-action{height:30px;padding:0 9px;font-size:12px}.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.empty{padding:52px;text-align:center;color:var(--muted)}
+    .tip{position:relative;cursor:help;border-bottom:1px dotted rgba(102,114,127,.45)}
+    .tip[data-tip]:hover::after,.tip[data-tip]:focus::after{content:attr(data-tip);position:absolute;z-index:20;left:0;bottom:calc(100% + 8px);min-width:180px;max-width:320px;padding:8px 10px;border-radius:6px;background:#182230;color:#fff;font-size:12px;font-weight:500;line-height:1.45;white-space:pre-wrap;box-shadow:0 8px 24px rgba(16,24,40,.18);pointer-events:none}
+    .tip[data-tip]:hover::before,.tip[data-tip]:focus::before{content:"";position:absolute;z-index:20;left:12px;bottom:calc(100% + 2px);border:6px solid transparent;border-top-color:#182230;pointer-events:none}
+    th.tip{border-bottom-color:transparent}
     .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px}.pager-info{color:var(--muted);font-size:13px}.pager-buttons{display:flex;align-items:center;gap:7px}.pager button{height:32px}.page-number{min-width:72px;text-align:center;font-variant-numeric:tabular-nums}.footer-note{color:#7b8794;font-size:12px;margin:12px 2px 0}
     @media(max-width:860px){.header-inner,main{padding-left:14px;padding-right:14px}.stats{grid-template-columns:repeat(2,minmax(130px,1fr))}.toolbar-row{align-items:stretch}input[type=search]{min-width:100%;order:-1}.segments{width:100%}.segments button{flex:1}.spacer{display:none}.table-wrap{max-height:58vh}}
     @media(max-width:480px){.stats{grid-template-columns:1fr 1fr}.stat{padding:13px}.stat-value{font-size:23px}.brand p{display:none}.toolbar-row button{flex:1}.segments button{padding:0 7px}.auto{width:100%}}
@@ -826,16 +837,16 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态码</th><th>失败类型</th><th>24h用量 / 上限</th><th>原因</th><th>当前处置</th><th>最后使用</th><th>已下线(h)</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th class="tip" data-tip="触发隔离的 HTTP 状态码">状态码</th><th class="tip" data-tip="根据失败 body 粗分类，用于展示与按类 TTL">失败类型</th><th class="tip" data-tip="近 24h token / 参考上限（只读，不预 ban）">24h用量 / 上限</th><th>原因</th><th class="tip" data-tip="本地隔离与 CPA Management 停用/启用/半开试用进度。悬停单元格可看详情。">当前处置</th><th class="tip" data-tip="usage.sqlite 最近一次成功请求时间">最后使用</th><th class="tip" data-tip="本轮连续不可用整小时数（unusable_since 起算）">已下线(h)</th><th class="tip" data-tip="本轮冷却剩余时长">剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「最后使用」= usage.sqlite 最近成功请求；「已下线(h)」= 本轮连续不可用起点至今的整小时数（阶梯再隔离不重置）。「隔离时间」= 本轮冷却开始。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。</p>
+    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「最后使用」= usage.sqlite 最近成功请求；「已下线(h)」= 本轮连续不可用起点至今的整小时数（阶梯再隔离不重置）。「剩余时间」= 本轮冷却剩余。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
-    const state={bans:[],filter:'all',query:'',page:1,pageSize:50,selected:new Set(),timer:null};
+    const state={bans:[],filter:'all',query:'',page:1,pageSize:50,selected:new Set(),timer:null,half_open_success_threshold:2};
     const $=id=>document.getElementById(id);
     const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -847,10 +858,47 @@ func statusPage() string {
     function formatRemaining(seconds){seconds=Math.max(0,Number(seconds||0));const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);if(d)return d+'天 '+h+'小时';if(h)return h+'小时 '+m+'分';return m+'分钟'}
     function formatLastUsed(value){if(!value)return '—';const d=new Date(value);return Number.isNaN(d.getTime())?String(value):d.toLocaleString('zh-CN',{hour12:false})}
     function formatOfflineHours(h){h=Number(h);if(!Number.isFinite(h)||h<0)return '—';return String(Math.floor(h))}
+    function tipAttr(text){const s=String(text??'').trim();return s?' class="tip" data-tip="'+esc(s)+'"':'';}
+    function lastUsedTip(ban){if(!ban||!ban.last_used)return 'usage.sqlite 中暂无成功请求记录（可能从未成功，或库未接入）。';return '最近一次成功请求：'+formatLastUsed(ban.last_used)+'\n来源：CPAMP usage.sqlite（只读观测）';}
+    function offlineTip(ban){const h=formatOfflineHours(ban.offline_hours);const since=ban.unusable_since||ban.banned_at;if(!since&&h==='—')return '尚无连续不可用起点。';return '已下线 '+h+' 小时\n起点：'+(since?formatDate(since):'—')+'\n含义：本轮首次隔离时间；阶梯再隔离/试用失败不重置。';}
+    function remainTip(ban){return '本轮冷却剩余：'+formatRemaining(ban.remaining_seconds)+'\n计划解禁：'+(ban.reset_at?formatDate(ban.reset_at):'—')+'\n（不等于已下线时长）';}
     function reasonLabel(reason){return {payment_required:'无额度或无订阅',forbidden:'上游拒绝访问',unauthorized:'凭据未授权',rate_limited:'请求频率受限',rate_limited_fallback:'限流（默认冷却）'}[reason]||reason}
-    function managementState(ban){if(ban.phase==='trial'){const t=ban.trial_successes||0;return {label:'试用中('+t+')',className:'management-pending',title:'半开试用，成功次数 '+t}};if(ban.last_error)return {label:ban.management_disabled?'恢复重试中':'停用重试中',className:'management-error',title:ban.last_error};if(ban.management_disabled)return {label:Number(ban.remaining_seconds)>0?'已停用':'恢复中',className:Number(ban.remaining_seconds)>0?'management-ok':'management-pending',title:''};return {label:'等待停用',className:'management-pending',title:''}}
+    function managementState(ban){
+      const step=Number(ban.step||0);
+      const debt=Number(ban.debt_score||0);
+      const rem=formatRemaining(ban.remaining_seconds);
+      const extras=[];
+      if(step>0)extras.push('冷却阶梯 step='+step+'（0=6h / 1=12h / 2+=24h，受 class TTL 上限约束）');
+      if(debt>0)extras.push('债务 debt='+debt.toFixed(1));
+      if(ban.unusable_since)extras.push('连续不可用自 '+formatDate(ban.unusable_since));
+      const tail=extras.length?('\n'+extras.join('\n')):'';
+      if(ban.phase==='trial'){
+        const t=Number(ban.trial_successes||0);
+        const need=Number(state.half_open_success_threshold||2)||2;
+        return {
+          label:'半开试用 '+t+'/'+need,
+          className:'management-pending',
+          title:'半开试用：冷却到期后已重新启用，正在探活。\n成功 '+t+' / 需 '+need+' 次后恢复正常调度。\n失败会再隔离并加长冷却。\n试用截止：'+(ban.reset_at?formatDate(ban.reset_at):'—')+tail
+        };
+      }
+      if(ban.last_error){
+        const retryingDisable=!ban.management_disabled;
+        return {
+          label:retryingDisable?'停用失败·重试':'解禁失败·重试',
+          className:'management-error',
+          title:(retryingDisable?'Management 停用失败，将自动重试。':'Management 启用失败，将自动重试。')+'\n错误：'+String(ban.last_error||'')+tail
+        };
+      }
+      if(ban.management_disabled){
+        if(Number(ban.remaining_seconds)>0){
+          return {label:'已停用',className:'management-ok',title:'CPA 侧已标记 disabled，调度不会选用。\n本轮剩余冷却：'+rem+'\n计划解禁：'+(ban.reset_at?formatDate(ban.reset_at):'—')+tail};
+        }
+        return {label:'解禁中',className:'management-pending',title:'冷却已到，正在调用 Management 重新启用该凭据。'+tail};
+      }
+      return {label:'隔离中·待停用',className:'management-pending',title:'本地已从调度剔除。\n尚未在 CPA 侧成功标记 disabled（或等待后台写入）。\n本轮剩余：'+rem+tail};
+    }
 
-    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
+    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.half_open_success_threshold=Number(data.half_open_success_threshold||2)||2;state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
 
     const STATUS_COLORS={'ok':'#12b76a','disabled':'#98a2b3','401':'#1570ef','402':'#f79009','403':'#d92d20','429':'#7f56d9'};
     const CLASS_COLORS={ok:'#12b76a',auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
@@ -860,7 +908,7 @@ func statusPage() string {
     function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭（observe-usage / join-quota-state）';return}if(q.ok){el.className='quota-note ok';const src=q.source==='usage_sqlite'?'内嵌 usage.sqlite':(q.source||'state');el.textContent='用量观测：已连接 ['+src+'] '+(q.path||'')+' · 命中隔离行 '+Number(q.matched||0)+' · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'找不到 usage.sqlite')+'）。可配置 usage-db-path / XAI_AUTOBAN_USAGE_DB 或 CPAMP_USAGE_DB'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
     function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
-    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time" title="'+esc(ban.last_used||'')+'">'+esc(formatLastUsed(ban.last_used))+'</td><td class="remaining" title="'+esc(ban.unusable_since||ban.banned_at||'')+'">'+esc(formatOfflineHours(ban.offline_hours))+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
+    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+' tip" data-tip="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time tip" data-tip="'+esc(lastUsedTip(ban))+'">'+esc(formatLastUsed(ban.last_used))+'</td><td class="remaining tip" data-tip="'+esc(offlineTip(ban))+'">'+esc(formatOfflineHours(ban.offline_hours))+'</td><td class="remaining tip" data-tip="'+esc(remainTip(ban))+'">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
     function changePage(delta){state.page+=delta;render();document.querySelector('.table-wrap').scrollTop=0}
     async function runAction(params,question,successText){if(question&&!confirm(question))return;try{setMessage('正在执行操作...');const result=await api('/action?'+new URLSearchParams(params));state.selected.clear();const done=successText?successText(result):('操作完成，已解禁 '+(result.removed||0)+' 个凭据');setMessage(done);await loadData(true)}catch(error){setMessage(error.message,true)}}
     function unbanOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'unban',auth_id:id},'确认解禁该凭据？\n'+id)}
