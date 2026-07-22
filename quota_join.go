@@ -20,6 +20,8 @@ type quotaAccountView struct {
 	StatusKind  string `json:"status_kind,omitempty"`
 	OverRef     bool   `json:"over_reference,omitempty"`
 	Source      string `json:"source,omitempty"`
+	// LastUsed is the most recent successful xAI usage (UTC). Zero if unknown.
+	LastUsed time.Time `json:"last_used,omitempty"`
 }
 
 type quotaStateFile struct {

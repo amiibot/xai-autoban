@@ -138,3 +138,39 @@ func TestSuccessDecaysDebt(t *testing.T) {
 		t.Fatalf("after success evidence=%#v", ev)
 	}
 }
+
+func TestUnusableSinceSurvivesStepUp(t *testing.T) {
+	state := newBanState()
+	cfg := defaultRuntimeConfig()
+	now := time.Now()
+	start := now.Add(-30 * time.Hour)
+	// First isolation sets UnusableSince.
+	cls := classifyFailure(403, "permission-denied", true)
+	_, entered := state.applyFailure("u1", "idx-u1", 403, cls, start, cfg)
+	if !entered {
+		t.Fatal("expected enter isolation")
+	}
+	entry := state.lookup([]string{"u1"})["u1"]
+	if entry.UnusableSince.IsZero() || !entry.UnusableSince.Equal(start) {
+		t.Fatalf("unusable_since want %v got %v", start, entry.UnusableSince)
+	}
+	// Move to trial then fail → step+1, BannedAt refreshes, UnusableSince must stay.
+	entry.Phase = phaseTrial
+	entry.TrialDeadline = now.Add(time.Hour)
+	entry.ManagementDisabled = false
+	state.set("u1", entry)
+	_, entered = state.applyFailure("u1", "idx-u1", 403, cls, now, cfg)
+	if !entered {
+		t.Fatal("trial fail should re-isolate")
+	}
+	entry = state.lookup([]string{"u1"})["u1"]
+	if entry.Step != 1 {
+		t.Fatalf("step=%d", entry.Step)
+	}
+	if !entry.UnusableSince.Equal(start) {
+		t.Fatalf("unusable_since must survive step-up: start=%v got=%v banned_at=%v", start, entry.UnusableSince, entry.BannedAt)
+	}
+	if entry.BannedAt.Equal(start) {
+		t.Fatal("banned_at should refresh on re-isolate")
+	}
+}

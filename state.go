@@ -40,6 +40,10 @@ type banEntry struct {
 	TrialDeadline time.Time `json:"trial_deadline,omitempty"`
 	// ForceHealthy: manual unban — after re-enable, drop row without half-open trial.
 	ForceHealthy bool `json:"force_healthy,omitempty"`
+	// UnusableSince is the first time this account entered isolation for the current
+	// outage spell. Survives stepped re-isolation / trial failure; cleared on graduate
+	// or manual unban. Used for panel "已下线(h)". Zero on legacy rows → fall back to BannedAt.
+	UnusableSince time.Time `json:"unusable_since,omitempty"`
 }
 
 type persistedState struct {
@@ -103,6 +107,10 @@ func (s *banState) configure(stateFile string) error {
 			continue
 		}
 		entry.Phase = normalizePhase(entry.Phase)
+		// Legacy rows: treat first known banned_at as outage start.
+		if entry.UnusableSince.IsZero() && !entry.BannedAt.IsZero() {
+			entry.UnusableSince = entry.BannedAt
+		}
 		if current, ok := s.bans[authID]; !ok || current.ResetAt.Before(entry.ResetAt) || entry.ManagementDisabled {
 			s.bans[authID] = entry
 		}
@@ -145,9 +153,16 @@ func (s *banState) set(authID string, entry banEntry) {
 		if entry.Phase == "" {
 			entry.Phase = current.Phase
 		}
+		// Never shrink the outage start when merging.
+		if entry.UnusableSince.IsZero() || (!current.UnusableSince.IsZero() && current.UnusableSince.Before(entry.UnusableSince)) {
+			entry.UnusableSince = current.UnusableSince
+		}
 	}
 	if entry.Phase == "" {
 		entry.Phase = phaseIsolated
+	}
+	if entry.UnusableSince.IsZero() && !entry.BannedAt.IsZero() {
+		entry.UnusableSince = entry.BannedAt
 	}
 	s.bans[authID] = entry
 	s.persistLocked()
@@ -519,6 +534,13 @@ func (s *banState) applyFailure(authID, authIndex string, status int, cls classi
 		if authIndex != "" {
 			entry.AuthIndex = authIndex
 		}
+		if entry.UnusableSince.IsZero() {
+			if !entry.BannedAt.IsZero() {
+				entry.UnusableSince = entry.BannedAt
+			} else {
+				entry.UnusableSince = now
+			}
+		}
 		s.bans[authID] = entry
 		s.evidence[authID] = ev
 		s.persistLocked()
@@ -533,6 +555,13 @@ func (s *banState) applyFailure(authID, authIndex string, status int, cls classi
 		}
 		ev.Step = step
 		duration := cfg.isolationDuration(cls.Class, step)
+		unusableSince := entry.UnusableSince
+		if unusableSince.IsZero() {
+			unusableSince = entry.BannedAt
+		}
+		if unusableSince.IsZero() {
+			unusableSince = now
+		}
 		entry = banEntry{
 			AuthIndex:       firstNonEmpty(authIndex, entry.AuthIndex),
 			StatusCode:      status,
@@ -547,6 +576,7 @@ func (s *banState) applyFailure(authID, authIndex string, status int, cls classi
 			Streak:          ev.Streak,
 			// Management was enabled during trial; need disable again.
 			ManagementDisabled: false,
+			UnusableSince:      unusableSince,
 		}
 		s.bans[authID] = entry
 		s.evidence[authID] = ev
@@ -576,6 +606,7 @@ func (s *banState) applyFailure(authID, authIndex string, status int, cls classi
 		Step:            step,
 		DebtScore:       ev.DebtScore,
 		Streak:          ev.Streak,
+		UnusableSince:   now,
 	}
 	s.bans[authID] = entry
 	s.evidence[authID] = ev
@@ -681,6 +712,13 @@ func (s *banState) reisolateTimedOutTrials(now time.Time, cfg runtimeConfig) int
 		ev.Step = step
 		ev.UpdatedAt = now
 		s.evidence[authID] = ev
+		if entry.UnusableSince.IsZero() {
+			if !entry.BannedAt.IsZero() {
+				entry.UnusableSince = entry.BannedAt
+			} else {
+				entry.UnusableSince = now
+			}
+		}
 		entry.Phase = phaseIsolated
 		entry.Step = step
 		entry.BannedAt = now

@@ -41,7 +41,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.4.0"
+	pluginVersion = "1.4.1"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -165,7 +165,7 @@ func pluginRegistration() registration {
 				{Name: "half-open-enabled", Type: pluginapi.ConfigFieldTypeString, Description: "到期后是否进入半开试用，默认 true。"},
 				{Name: "half-open-success-threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "试用成功次数毕业，默认 2。"},
 				{Name: "cooldown-hours", Type: pluginapi.ConfigFieldTypeArray, Description: "阶梯冷却小时列表，默认 [6,12,24]。"},
-				
+
 				{Name: "observe-usage", Type: pluginapi.ConfigFieldTypeString, Description: "是否内嵌读取 CPAMP usage.sqlite 做 24h 用量观测，默认 true（不依赖 grok-quota）。"},
 				{Name: "usage-db-path", Type: pluginapi.ConfigFieldTypeString, Description: "usage.sqlite 路径；空则自动探测。"},
 				{Name: "auth-dir", Type: pluginapi.ConfigFieldTypeString, Description: "CPA auths 目录（可选，用于邮箱 enrich）。"},
@@ -400,9 +400,9 @@ func importSnapshot(raw []byte) pluginapi.ManagementResponse {
 }
 
 type statusInfo struct {
-	Plugin           string               `json:"plugin"`
-	Version          string               `json:"version"`
-	Count            int                  `json:"count"`
+	Plugin  string `json:"plugin"`
+	Version string `json:"version"`
+	Count   int    `json:"count"`
 	// PoolTotal is xAI credentials known to the pie (banned + normal when available).
 	PoolTotal int `json:"pool_total"`
 	// NormalCount is currently not banned (and not disabled, when known).
@@ -447,17 +447,17 @@ type managementStatusInfo struct {
 }
 
 type banInfo struct {
-	AuthID             string `json:"auth_id"`
-	AuthIndex          string `json:"auth_index,omitempty"`
-	StatusCode         int    `json:"status_code"`
-	Class              string `json:"class,omitempty"`
-	Reason             string `json:"reason"`
-	BodyFingerprint    string `json:"body_fingerprint,omitempty"`
-	BannedAt           string `json:"banned_at"`
-	ResetAt            string `json:"reset_at"`
-	RemainingSeconds   int64  `json:"remaining_seconds"`
-	ManagementDisabled bool   `json:"management_disabled"`
-	Deletable          bool   `json:"deletable"`
+	AuthID             string  `json:"auth_id"`
+	AuthIndex          string  `json:"auth_index,omitempty"`
+	StatusCode         int     `json:"status_code"`
+	Class              string  `json:"class,omitempty"`
+	Reason             string  `json:"reason"`
+	BodyFingerprint    string  `json:"body_fingerprint,omitempty"`
+	BannedAt           string  `json:"banned_at"`
+	ResetAt            string  `json:"reset_at"`
+	RemainingSeconds   int64   `json:"remaining_seconds"`
+	ManagementDisabled bool    `json:"management_disabled"`
+	Deletable          bool    `json:"deletable"`
 	LastError          string  `json:"last_error,omitempty"`
 	Phase              string  `json:"phase,omitempty"`
 	Step               int     `json:"step,omitempty"`
@@ -470,11 +470,17 @@ type banInfo struct {
 	QuotaHealth string `json:"quota_health,omitempty"`
 	QuotaEmail  string `json:"quota_email,omitempty"`
 	OverRef     bool   `json:"over_reference,omitempty"`
+	// LastUsed: latest successful xAI usage from usage.sqlite (observe only).
+	LastUsed string `json:"last_used,omitempty"`
+	// UnusableSince: first isolation of current outage spell (survives step-up).
+	UnusableSince string `json:"unusable_since,omitempty"`
+	// OfflineHours: floor hours since UnusableSince (or BannedAt fallback). Panel "已下线(h)".
+	OfflineHours int64 `json:"offline_hours"`
 }
 
 const (
 	// chart keys for non-HTTP / healthy accounts
-	chartKeyOK      = "ok"
+	chartKeyOK       = "ok"
 	chartKeyDisabled = "disabled"
 	classOK          = "ok"
 )
@@ -515,13 +521,28 @@ func currentStatus() statusInfo {
 		if entry.AuthIndex != "" {
 			bannedKeys[entry.AuthIndex] = struct{}{}
 		}
+		unusableSince := entry.UnusableSince
+		if unusableSince.IsZero() {
+			unusableSince = entry.BannedAt
+		}
+		offlineHours := int64(0)
+		if !unusableSince.IsZero() {
+			h := int64(now.Sub(unusableSince).Hours())
+			if h < 0 {
+				h = 0
+			}
+			offlineHours = h
+		}
 		info := banInfo{
 			AuthID: id, AuthIndex: entry.AuthIndex, StatusCode: entry.StatusCode, Class: class, Reason: entry.Reason,
 			BodyFingerprint: entry.BodyFingerprint, BannedAt: entry.BannedAt.Format(time.RFC3339),
 			ResetAt: entry.ResetAt.Format(time.RFC3339), RemainingSeconds: remaining,
 			ManagementDisabled: entry.ManagementDisabled, Deletable: entry.StatusCode == 403, LastError: entry.LastError,
-				Phase: normalizePhase(entry.Phase), Step: entry.Step, DebtScore: entry.DebtScore, Streak: entry.Streak,
-				TrialSuccesses: entry.TrialSuccesses,
+			Phase: normalizePhase(entry.Phase), Step: entry.Step, DebtScore: entry.DebtScore, Streak: entry.Streak,
+			TrialSuccesses: entry.TrialSuccesses, OfflineHours: offlineHours,
+		}
+		if !unusableSince.IsZero() {
+			info.UnusableSince = unusableSince.Format(time.RFC3339)
 		}
 		if qidx.OK {
 			if q, ok := qidx.lookup(id, entry.AuthIndex, ""); ok {
@@ -534,6 +555,9 @@ func currentStatus() statusInfo {
 				info.QuotaHealth = firstNonEmpty(q.QuotaHealth, q.StatusKind)
 				info.QuotaEmail = q.Email
 				info.OverRef = q.OverRef
+				if !q.LastUsed.IsZero() {
+					info.LastUsed = q.LastUsed.Format(time.RFC3339)
+				}
 			}
 		}
 		items = append(items, info)
@@ -743,7 +767,7 @@ func statusPage() string {
     main{max-width:1440px;margin:auto;padding:20px 24px 36px}.stats{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:12px;margin-bottom:16px}.stat{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:16px;box-shadow:var(--shadow)}.stat-label{font-size:12px;color:var(--muted);font-weight:600}.stat-value{font-size:28px;line-height:1.1;font-weight:750;margin-top:7px}.stat-total{border-left:4px solid var(--blue)}.stat-401{border-left:4px solid #1570ef}.stat-402{border-left:4px solid #f79009}.stat-403{border-left:4px solid #d92d20}.stat-429{border-left:4px solid #7f56d9}
     .toolbar{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);margin-bottom:14px}.toolbar-row{display:flex;align-items:center;gap:10px;padding:12px;flex-wrap:wrap}.toolbar-row+.toolbar-row{border-top:1px solid var(--line)}input[type=search]{height:36px;min-width:260px;flex:1;border:1px solid #bfc8d2;border-radius:6px;padding:0 11px;background:#fff;color:var(--text);font-size:14px}.segments{display:flex;border:1px solid #bfc8d2;border-radius:6px;overflow:hidden}.segments button{border:0;border-right:1px solid #bfc8d2;border-radius:0;background:#fff;color:#344054}.segments button:last-child{border-right:0}.segments button.active{background:#e8eef6;color:#101828;font-weight:700}
     button{height:36px;border:1px solid #bfc8d2;border-radius:6px;background:#fff;color:#273240;padding:0 12px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}button:hover{background:#f2f4f7}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.primary:hover{background:#164ca7}.danger{color:#b42318;border-color:#f1a39b;background:#fff}.danger:hover{background:var(--red-bg)}.quiet-danger{color:#b42318}.spacer{flex:1}.auto{display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.auto input{width:16px;height:16px}.message{min-height:20px;color:var(--muted);font-size:13px}.message.error{color:var(--red)}
-    .table-shell{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);overflow:hidden}.table-head{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.table-head strong{font-size:14px}.table-head span{color:var(--muted);font-size:13px}.table-wrap{overflow:auto;max-height:64vh}table{border-collapse:collapse;width:100%;min-width:1040px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #edf0f3;vertical-align:middle}th{position:sticky;top:0;background:#f8fafb;color:#475467;font-size:12px;font-weight:700;z-index:1}tbody tr:hover{background:#f9fbfc}td code{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;color:#344054}.check{width:38px;text-align:center}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:24px;border-radius:12px;font-weight:750;font-size:12px}.b401{color:#175cd3;background:#eff8ff}.b402{color:var(--amber);background:var(--amber-bg)}.b403{color:var(--red);background:var(--red-bg)}.b429{color:#6941c6;background:#f4f3ff}.reason{color:#475467}.time{white-space:nowrap}.remaining{font-variant-numeric:tabular-nums;font-weight:650}.management-ok{color:var(--green);font-weight:650}.management-pending{color:var(--amber);font-weight:650}.management-error{color:var(--red);font-weight:650}.row-action{height:30px;padding:0 9px;font-size:12px}.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.empty{padding:52px;text-align:center;color:var(--muted)}
+    .table-shell{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);overflow:hidden}.table-head{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.table-head strong{font-size:14px}.table-head span{color:var(--muted);font-size:13px}.table-wrap{overflow:auto;max-height:64vh}table{border-collapse:collapse;width:100%;min-width:1280px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #edf0f3;vertical-align:middle}th{position:sticky;top:0;background:#f8fafb;color:#475467;font-size:12px;font-weight:700;z-index:1}tbody tr:hover{background:#f9fbfc}td code{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;color:#344054}.check{width:38px;text-align:center}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:24px;border-radius:12px;font-weight:750;font-size:12px}.b401{color:#175cd3;background:#eff8ff}.b402{color:var(--amber);background:var(--amber-bg)}.b403{color:var(--red);background:var(--red-bg)}.b429{color:#6941c6;background:#f4f3ff}.reason{color:#475467}.time{white-space:nowrap}.remaining{font-variant-numeric:tabular-nums;font-weight:650}.management-ok{color:var(--green);font-weight:650}.management-pending{color:var(--amber);font-weight:650}.management-error{color:var(--red);font-weight:650}.row-action{height:30px;padding:0 9px;font-size:12px}.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.empty{padding:52px;text-align:center;color:var(--muted)}
     .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px}.pager-info{color:var(--muted);font-size:13px}.pager-buttons{display:flex;align-items:center;gap:7px}.pager button{height:32px}.page-number{min-width:72px;text-align:center;font-variant-numeric:tabular-nums}.footer-note{color:#7b8794;font-size:12px;margin:12px 2px 0}
     @media(max-width:860px){.header-inner,main{padding-left:14px;padding-right:14px}.stats{grid-template-columns:repeat(2,minmax(130px,1fr))}.toolbar-row{align-items:stretch}input[type=search]{min-width:100%;order:-1}.segments{width:100%}.segments button{flex:1}.spacer{display:none}.table-wrap{max-height:58vh}}
     @media(max-width:480px){.stats{grid-template-columns:1fr 1fr}.stat{padding:13px}.stat-value{font-size:23px}.brand p{display:none}.toolbar-row button{flex:1}.segments button{padding:0 7px}.auto{width:100%}}
@@ -802,12 +826,12 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态码</th><th>失败类型</th><th>24h用量 / 上限</th><th>原因</th><th>当前处置</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th>状态码</th><th>失败类型</th><th>24h用量 / 上限</th><th>原因</th><th>当前处置</th><th>最后使用</th><th>已下线(h)</th><th>隔离时间</th><th>自动解禁</th><th>剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「失败类型」= 上游分类；「当前处置」= 停用进度或试用中。permission 一次即硬隔离但仍可到期试用。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。</p>
+    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「最后使用」= usage.sqlite 最近成功请求；「已下线(h)」= 本轮连续不可用起点至今的整小时数（阶梯再隔离不重置）。「隔离时间」= 本轮冷却开始。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
@@ -821,6 +845,8 @@ func statusPage() string {
     function filtered(){const q=state.query.toLowerCase();return state.bans.filter(ban=>(state.filter==='all'||String(ban.status_code)===state.filter)&&(!q||ban.auth_id.toLowerCase().includes(q)||ban.reason.toLowerCase().includes(q)))}
     function formatDate(value){const d=new Date(value);return Number.isNaN(d.getTime())?value:d.toLocaleString('zh-CN',{hour12:false})}
     function formatRemaining(seconds){seconds=Math.max(0,Number(seconds||0));const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);if(d)return d+'天 '+h+'小时';if(h)return h+'小时 '+m+'分';return m+'分钟'}
+    function formatLastUsed(value){if(!value)return '—';const d=new Date(value);return Number.isNaN(d.getTime())?String(value):d.toLocaleString('zh-CN',{hour12:false})}
+    function formatOfflineHours(h){h=Number(h);if(!Number.isFinite(h)||h<0)return '—';return String(Math.floor(h))}
     function reasonLabel(reason){return {payment_required:'无额度或无订阅',forbidden:'上游拒绝访问',unauthorized:'凭据未授权',rate_limited:'请求频率受限',rate_limited_fallback:'限流（默认冷却）'}[reason]||reason}
     function managementState(ban){if(ban.phase==='trial'){const t=ban.trial_successes||0;return {label:'试用中('+t+')',className:'management-pending',title:'半开试用，成功次数 '+t}};if(ban.last_error)return {label:ban.management_disabled?'恢复重试中':'停用重试中',className:'management-error',title:ban.last_error};if(ban.management_disabled)return {label:Number(ban.remaining_seconds)>0?'已停用':'恢复中',className:Number(ban.remaining_seconds)>0?'management-ok':'management-pending',title:''};return {label:'等待停用',className:'management-pending',title:''}}
 
@@ -834,7 +860,7 @@ func statusPage() string {
     function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭（observe-usage / join-quota-state）';return}if(q.ok){el.className='quota-note ok';const src=q.source==='usage_sqlite'?'内嵌 usage.sqlite':(q.source||'state');el.textContent='用量观测：已连接 ['+src+'] '+(q.path||'')+' · 命中隔离行 '+Number(q.matched||0)+' · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'找不到 usage.sqlite')+'）。可配置 usage-db-path / XAI_AUTOBAN_USAGE_DB 或 CPAMP_USAGE_DB'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
     function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
-    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
+    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+'" title="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time" title="'+esc(ban.last_used||'')+'">'+esc(formatLastUsed(ban.last_used))+'</td><td class="remaining" title="'+esc(ban.unusable_since||ban.banned_at||'')+'">'+esc(formatOfflineHours(ban.offline_hours))+'</td><td class="time">'+esc(formatDate(ban.banned_at))+'</td><td class="time">'+esc(formatDate(ban.reset_at))+'</td><td class="remaining">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
     function changePage(delta){state.page+=delta;render();document.querySelector('.table-wrap').scrollTop=0}
     async function runAction(params,question,successText){if(question&&!confirm(question))return;try{setMessage('正在执行操作...');const result=await api('/action?'+new URLSearchParams(params));state.selected.clear();const done=successText?successText(result):('操作完成，已解禁 '+(result.removed||0)+' 个凭据');setMessage(done);await loadData(true)}catch(error){setMessage(error.message,true)}}
     function unbanOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'unban',auth_id:id},'确认解禁该凭据？\n'+id)}

@@ -135,18 +135,20 @@ func deriveEmail(accountSnapshot, authFile string) string {
 
 func loadRollingUsage(db *sql.DB, now time.Time, window time.Duration) (map[string]usageAgg, error) {
 	sinceMS := now.Add(-window).UnixMilli()
+	// tokens/success/failed stay windowed; last_used is all-time latest success so
+	// panel "最后使用" still works when the account has been idle >24h.
 	rows, err := db.Query(`
 		SELECT auth_index,
 			COALESCE(MAX(auth_file_snapshot), ''),
 			COALESCE(MAX(account_snapshot), ''),
-			COALESCE(SUM(CASE WHEN failed = 0 THEN total_tokens ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN failed = 0 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN failed = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed = 0 AND timestamp_ms >= ? THEN total_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed = 0 AND timestamp_ms >= ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed = 1 AND timestamp_ms >= ? THEN 1 ELSE 0 END), 0),
 			COALESCE(MAX(CASE WHEN failed = 0 THEN timestamp_ms ELSE NULL END), 0)
 		FROM usage_events
-		WHERE auth_provider_snapshot = ? AND timestamp_ms >= ?
+		WHERE auth_provider_snapshot = ?
 		GROUP BY auth_index
-	`, xaiProvider, sinceMS)
+	`, sinceMS, sinceMS, sinceMS, xaiProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +163,10 @@ func loadRollingUsage(db *sql.DB, now time.Time, window time.Duration) (map[stri
 		}
 		authIndex = strings.TrimSpace(authIndex)
 		if authIndex == "" {
+			continue
+		}
+		// Skip rows with no recent activity and no ever-success (noise).
+		if tokens == 0 && success == 0 && failed == 0 && lastMS == 0 {
 			continue
 		}
 		agg := usageAgg{
@@ -365,6 +371,7 @@ func computeQuotaObserve(usageDBPath, authDir string) quotaJoinIndex {
 			QuotaLimit: dynamicLimit(tokens, defaultReferenceTokens),
 			Source:     sourceRollingUsage,
 			OverRef:    tokens > defaultReferenceTokens,
+			LastUsed:   u.lastUsage,
 		}
 		if cool {
 			view.QuotaHealth = "cooldown"

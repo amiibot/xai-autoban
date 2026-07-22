@@ -79,6 +79,13 @@ func TestLoadQuotaObserveFromSQLite(t *testing.T) {
 	if !ok || a.Tokens24h != 2_000_000 {
 		t.Fatalf("lookup failed: %#v ok=%v", a, ok)
 	}
+	if a.LastUsed.IsZero() {
+		t.Fatal("expected LastUsed from successful usage events")
+	}
+	wantLast := time.UnixMilli(ts + 1).UTC()
+	if !a.LastUsed.Equal(wantLast) {
+		t.Fatalf("LastUsed=%v want %v", a.LastUsed, wantLast)
+	}
 	if a.QuotaLimit < a.Tokens24h {
 		t.Fatalf("limit should be at least usage: %#v", a)
 	}
