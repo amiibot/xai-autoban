@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -293,7 +294,6 @@ func TestStateReloadKeepsPendingReenable(t *testing.T) {
 	}
 }
 
-
 func TestPublicDeleteOnlyAllows403(t *testing.T) {
 	bans.clearAll()
 	now := time.Now()
@@ -477,3 +477,48 @@ func waitFor(t *testing.T, condition func() bool) {
 
 var jsonMarshal = func(v any) ([]byte, error) { return json.Marshal(v) }
 var jsonUnmarshal = func(data []byte, v any) error { return json.Unmarshal(data, v) }
+
+func TestBuildExportBundleAndCSV(t *testing.T) {
+	now := time.Now()
+	bans = newBanState()
+	bans.set("export-a", banEntry{
+		AuthIndex: "idx-a", StatusCode: 403, Class: classPermission, Reason: "permission_denied",
+		BannedAt: now.Add(-2 * time.Hour), ResetAt: now.Add(2 * time.Hour),
+		Phase: phaseIsolated, UnusableSince: now.Add(-2 * time.Hour),
+	})
+	// minimal controller so config() works
+	if autoban == nil {
+		autoban = newAutobanController(bans)
+	} else {
+		autoban.state = bans
+	}
+	bundle := buildExportBundle()
+	if bundle.ExportVersion != 1 || bundle.Plugin != pluginName {
+		t.Fatalf("bundle meta %#v", bundle)
+	}
+	if bundle.Status.Count != 1 {
+		t.Fatalf("status count=%d", bundle.Status.Count)
+	}
+	if _, ok := bundle.StateBans["export-a"]; !ok {
+		t.Fatal("state_bans missing export-a")
+	}
+	raw, err := bansCSV(bundle.Status.Bans)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < 10 || !bytes.Contains(raw, []byte("export-a")) {
+		t.Fatalf("csv unexpected: %q", raw[:min(80, len(raw))])
+	}
+	// handleExport json
+	resp := handleExport(pluginapi.ManagementRequest{Method: http.MethodGet, Query: url.Values{}})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("json export status %d body %s", resp.StatusCode, resp.Body)
+	}
+	if ct := resp.Headers.Get("Content-Type"); !strings.Contains(ct, "json") {
+		t.Fatalf("content-type %s", ct)
+	}
+	respCSV := handleExport(pluginapi.ManagementRequest{Method: http.MethodGet, Query: url.Values{"format": {"csv"}}})
+	if respCSV.StatusCode != http.StatusOK || !bytes.Contains(respCSV.Body, []byte("export-a")) {
+		t.Fatalf("csv export failed status=%d", respCSV.StatusCode)
+	}
+}

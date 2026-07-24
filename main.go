@@ -23,7 +23,9 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -41,7 +43,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.4.2"
+	pluginVersion = "1.4.3"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -229,10 +231,12 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: managementPrefix + "/delete-403", Description: "Permanently delete all currently tracked 403 credentials via Management API."},
 			{Method: http.MethodPost, Path: managementPrefix + "/delete-classes", Description: "Delete by classes. Body: {\"classes\":[\"permission\"]}."},
 			{Method: http.MethodPost, Path: managementPrefix + "/import", Description: "Restore a previously exported ban snapshot."},
+			{Method: http.MethodGet, Path: managementPrefix + "/export", Description: "Export full analysis snapshot JSON (same as public /export)."},
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{Path: "/status", Menu: "xAI Autoban", Description: "View and release xAI credentials excluded after classified failures."},
 			{Path: "/data", Description: "Public xAI autoban status data."},
+			{Path: "/export", Description: "Download full analysis snapshot (JSON). Query format=csv for ban CSV."},
 			{Path: "/action", Description: "Public xAI autoban actions."},
 		},
 	}
@@ -293,6 +297,10 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		return importSnapshot(req.Body)
 	case method == http.MethodGet && matchesResourcePath(req.Path, "data"):
 		return jsonResponse(http.StatusOK, currentStatus())
+	case method == http.MethodGet && matchesResourcePath(req.Path, "export"):
+		return handleExport(req)
+	case method == http.MethodGet && strings.HasSuffix(strings.TrimRight(req.Path, "/"), managementPrefix+"/export"):
+		return handleExport(req)
 	case method == http.MethodGet && matchesResourcePath(req.Path, "action"):
 		return publicAction(req)
 	case method == http.MethodGet && (matchesResourcePath(req.Path, "status") || strings.HasSuffix(strings.TrimRight(req.Path, "/"), managementPrefix+"/status")):
@@ -372,6 +380,183 @@ func publicAction(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	}
 	slog.Warn("xai-autoban: public unban action", "operation", op, "removed", removed)
 	return jsonResponse(http.StatusOK, map[string]any{"ok": true, "removed": removed, "status": currentStatus()})
+}
+
+type exportBundle struct {
+	ExportVersion int                       `json:"export_version"`
+	Plugin        string                    `json:"plugin"`
+	Version       string                    `json:"version"`
+	ExportedAt    string                    `json:"exported_at"`
+	Status        statusInfo                `json:"status"`
+	StateBans     map[string]banEntry       `json:"state_bans"`
+	StateEvidence map[string]evidenceLedger `json:"state_evidence,omitempty"`
+	UsageAccounts []quotaAccountView        `json:"usage_accounts,omitempty"`
+	Notes         []string                  `json:"notes,omitempty"`
+}
+
+func buildExportBundle() exportBundle {
+	now := time.Now().UTC()
+	status := currentStatus()
+	bansMap, evidenceMap := bans.exportState()
+	cfg := autoban.config()
+	var usage []quotaAccountView
+	if cfg.ObserveUsage || cfg.JoinQuotaState {
+		qidx := loadQuotaUsage(cfg)
+		if qidx.OK {
+			// de-dupe by auth_index preferred
+			seen := map[string]struct{}{}
+			for _, v := range qidx.ByIndex {
+				key := strings.TrimSpace(v.AuthIndex)
+				if key == "" {
+					key = strings.ToLower(strings.TrimSpace(v.Email))
+				}
+				if key == "" {
+					continue
+				}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				usage = append(usage, v)
+			}
+			for email, v := range qidx.ByEmail {
+				key := strings.TrimSpace(v.AuthIndex)
+				if key == "" {
+					key = strings.ToLower(strings.TrimSpace(email))
+				}
+				if key == "" {
+					continue
+				}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				usage = append(usage, v)
+			}
+			sort.Slice(usage, func(i, j int) bool {
+				if usage[i].AuthIndex == usage[j].AuthIndex {
+					return usage[i].Email < usage[j].Email
+				}
+				return usage[i].AuthIndex < usage[j].AuthIndex
+			})
+		}
+	}
+	notes := []string{
+		"status.bans: panel join view (isolation rows + usage fields)",
+		"state_bans/state_evidence: raw plugin state for offline analysis",
+		"usage_accounts: observed xAI accounts from usage.sqlite / quota state (not only banned)",
+		"observe-only fields never trigger ban decisions",
+	}
+	return exportBundle{
+		ExportVersion: 1,
+		Plugin:        pluginName,
+		Version:       pluginVersion,
+		ExportedAt:    now.Format(time.RFC3339),
+		Status:        status,
+		StateBans:     bansMap,
+		StateEvidence: evidenceMap,
+		UsageAccounts: usage,
+		Notes:         notes,
+	}
+}
+
+func handleExport(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	format := strings.ToLower(strings.TrimSpace(req.Query.Get("format")))
+	if format == "" {
+		// allow /export.csv style via path suffix handled as resource name "export" only;
+		// clients pass ?format=csv
+		format = "json"
+	}
+	bundle := buildExportBundle()
+	if format == "csv" || format == "bans.csv" {
+		raw, err := bansCSV(bundle.Status.Bans)
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "csv_failed", "message": err.Error()})
+		}
+		name := "xai-autoban-bans-" + time.Now().UTC().Format("20060102-150405") + ".csv"
+		return pluginapi.ManagementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":        {"text/csv; charset=utf-8"},
+				"Content-Disposition": {"attachment; filename=\"" + name + "\""},
+			},
+			Body: raw,
+		}
+	}
+	// default JSON (pretty for local analysis)
+	raw, err := json.MarshalIndent(bundle, "", "  ")
+	if err != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "marshal_failed", "message": err.Error()})
+	}
+	name := "xai-autoban-export-" + time.Now().UTC().Format("20060102-150405") + ".json"
+	return pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers: http.Header{
+			"Content-Type":        {"application/json; charset=utf-8"},
+			"Content-Disposition": {"attachment; filename=\"" + name + "\""},
+		},
+		Body: raw,
+	}
+}
+
+func bansCSV(items []banInfo) ([]byte, error) {
+	var buf bytes.Buffer
+	// UTF-8 BOM helps Excel open Chinese headers correctly.
+	buf.Write([]byte{0xEF, 0xBB, 0xBF})
+	w := csv.NewWriter(&buf)
+	header := []string{
+		"auth_id", "auth_index", "status_code", "class", "reason", "phase", "step",
+		"debt_score", "streak", "trial_successes",
+		"banned_at", "reset_at", "remaining_seconds", "unusable_since", "offline_hours",
+		"last_used", "tokens_24h", "quota_limit", "quota_email", "quota_health",
+		"management_disabled", "last_error", "deletable",
+	}
+	if err := w.Write(header); err != nil {
+		return nil, err
+	}
+	// stable order
+	sorted := append([]banInfo(nil), items...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].OfflineHours != sorted[j].OfflineHours {
+			return sorted[i].OfflineHours > sorted[j].OfflineHours
+		}
+		return sorted[i].AuthID < sorted[j].AuthID
+	})
+	for _, b := range sorted {
+		row := []string{
+			b.AuthID,
+			b.AuthIndex,
+			strconv.Itoa(b.StatusCode),
+			b.Class,
+			b.Reason,
+			b.Phase,
+			strconv.Itoa(b.Step),
+			strconv.FormatFloat(b.DebtScore, 'f', 3, 64),
+			strconv.Itoa(b.Streak),
+			strconv.Itoa(b.TrialSuccesses),
+			b.BannedAt,
+			b.ResetAt,
+			strconv.FormatInt(b.RemainingSeconds, 10),
+			b.UnusableSince,
+			strconv.FormatInt(b.OfflineHours, 10),
+			b.LastUsed,
+			strconv.FormatInt(b.Tokens24h, 10),
+			strconv.FormatInt(b.QuotaLimit, 10),
+			b.QuotaEmail,
+			b.QuotaHealth,
+			strconv.FormatBool(b.ManagementDisabled),
+			b.LastError,
+			strconv.FormatBool(b.Deletable),
+		}
+		if err := w.Write(row); err != nil {
+			return nil, err
+		}
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func importSnapshot(raw []byte) pluginapi.ManagementResponse {
@@ -822,6 +1007,8 @@ func statusPage() string {
       <div class="toolbar-row">
         <button id="unbanSelected" onclick="unbanSelected()" disabled>解禁已选</button>
         <button onclick="copyVisible()">复制当前 ID</button>
+        <button class="tip" data-tip="下载完整 JSON：隔离状态 + 原始 state + 用量观测账号，便于本地分析" onclick="exportJSON()">导出 JSON</button>
+        <button class="tip" data-tip="下载当前隔离行 CSV（Excel 可直接打开）" onclick="exportCSV()">导出 CSV</button>
         <span class="spacer"></span>
         <button class="quiet-danger" onclick="unbanStatus(401)">清除全部 401</button>
         <button class="quiet-danger" onclick="unbanStatus(402)">清除全部 402</button>
@@ -842,7 +1029,7 @@ func statusPage() string {
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「最后使用」= usage.sqlite 最近成功请求；「已下线(h)」= 本轮连续不可用起点至今的整小时数（阶梯再隔离不重置）。「剩余时间」= 本轮冷却剩余。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。</p>
+    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「最后使用」= usage.sqlite 最近成功请求；「已下线(h)」= 本轮连续不可用起点至今的整小时数（阶梯再隔离不重置）。「剩余时间」= 本轮冷却剩余。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。可用「导出 JSON / CSV」下载当前统计做本地分析。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
@@ -919,6 +1106,10 @@ func statusPage() string {
     function deleteSelected403(){const selected=state.bans.filter(x=>state.selected.has(x.auth_id)&&x.status_code===403);if(!selected.length){setMessage('没有已选的 403 账号',true);return}const ids=selected.map(x=>x.auth_id);runAction({op:'delete-many',auth_ids:ids.join(',')},'确认永久删除已选 '+ids.length+' 个 403 账号？\n此操作会从 CPA 删除凭据文件，不是解除禁用。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
     function deleteAll403(){const n=state.bans.filter(x=>x.status_code===403).length;runAction({op:'delete-403'},'确认永久删除全部 '+n+' 个 403 账号？\n此操作会从 CPA 删除凭据文件，不是解除禁用，且不可恢复。',r=>'操作完成，已永久删除 '+(r.deleted||0)+' 个 403 账号')}
     async function copyVisible(){const ids=filtered().map(x=>x.auth_id).join('\n');try{await navigator.clipboard.writeText(ids);setMessage('已复制 '+filtered().length+' 个 Auth ID')}catch(_){setMessage('浏览器拒绝访问剪贴板',true)}}
+    function stamp(){const d=new Date();const p=n=>String(n).padStart(2,'0');return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds())}
+    function downloadBlob(blob,filename){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1500)}
+    async function exportJSON(){try{setMessage('正在导出 JSON…');const data=await api('/export');const text=JSON.stringify(data,null,2);downloadBlob(new Blob([text],{type:'application/json;charset=utf-8'}), 'xai-autoban-export-'+stamp()+'.json');setMessage('已导出 JSON（隔离 '+Number((data.status&&data.status.count)||(data.status&&data.status.bans&&data.status.bans.length)||0)+' 行 · 用量账号 '+Number((data.usage_accounts||[]).length)+'）')}catch(error){setMessage(error.message,true)}}
+    async function exportCSV(){try{setMessage('正在导出 CSV…');const response=await fetch(base+'/export?format=csv',{cache:'no-store'});const text=await response.text();if(!response.ok){let msg=text;try{msg=(JSON.parse(text).error||text)}catch(_){ }throw new Error(msg||('HTTP '+response.status))}downloadBlob(new Blob([text],{type:'text/csv;charset=utf-8'}), 'xai-autoban-bans-'+stamp()+'.csv');setMessage('已导出 CSV')}catch(error){setMessage(error.message,true)}}
 
     $('search').addEventListener('input',event=>{state.query=event.target.value.trim();state.page=1;render()});
     $('filters').addEventListener('click',event=>{const button=event.target.closest('button');if(!button)return;state.filter=button.dataset.status;state.page=1;document.querySelectorAll('#filters button').forEach(x=>x.classList.toggle('active',x===button));render()});

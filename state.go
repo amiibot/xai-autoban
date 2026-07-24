@@ -738,6 +738,22 @@ func (s *banState) reisolateTimedOutTrials(now time.Time, cfg runtimeConfig) int
 	return n
 }
 
+// exportState returns deep-enough copies of bans + evidence for offline analysis.
+// Does not mutate state. Times are the live stored values.
+func (s *banState) exportState() (map[string]banEntry, map[string]evidenceLedger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bansOut := make(map[string]banEntry, len(s.bans))
+	for id, e := range s.bans {
+		bansOut[id] = e
+	}
+	evOut := make(map[string]evidenceLedger, len(s.evidence))
+	for id, e := range s.evidence {
+		evOut[id] = e
+	}
+	return bansOut, evOut
+}
+
 func (s *banState) clearEvidenceLocked(authID string, resetStep bool) {
 	if s.evidence == nil {
 		return
