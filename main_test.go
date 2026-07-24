@@ -32,7 +32,7 @@ func TestParseRuntimeConfig(t *testing.T) {
 func TestDefaultRuntimeConfigQueues429(t *testing.T) {
 	state := newBanState()
 	controller := newAutobanController(state)
-	// Single rate_limit only accumulates debt (0.5); does not isolate until threshold.
+	// v1.5: all handled statuses fail-immediate into cooling.
 	controller.handleUsage(pluginapi.UsageRecord{
 		Provider:  "xai",
 		AuthID:    "rate-limited-auth",
@@ -40,34 +40,12 @@ func TestDefaultRuntimeConfigQueues429(t *testing.T) {
 		Failed:    true,
 		Failure:   pluginapi.UsageFailure{StatusCode: http.StatusTooManyRequests},
 	})
-	state.mu.Lock()
-	_, ok := state.bans["rate-limited-auth"]
-	ev := state.evidence["rate-limited-auth"]
-	state.mu.Unlock()
-	if ok {
-		t.Fatal("single 429 should not isolate under debt policy")
-	}
-	if ev.DebtScore < 0.4 || ev.Streak != 1 {
-		t.Fatalf("expected debt/streak evidence, got %#v", ev)
-	}
-	// Streak threshold 3 → third consecutive 429 isolates.
-	for i := 0; i < 2; i++ {
-		controller.handleUsage(pluginapi.UsageRecord{
-			Provider: "xai", AuthID: "rate-limited-auth", AuthIndex: "idx-429",
-			Failed: true, Failure: pluginapi.UsageFailure{StatusCode: http.StatusTooManyRequests},
-		})
-	}
-	state.mu.Lock()
-	entry, ok := state.bans["rate-limited-auth"]
-	state.mu.Unlock()
+	entry, ok := state.lookup([]string{"rate-limited-auth"})["rate-limited-auth"]
 	if !ok {
-		t.Fatal("streak threshold should isolate after repeated 429")
+		t.Fatal("single 429 should isolate under fail-immediate policy")
 	}
-	if entry.StatusCode != http.StatusTooManyRequests || entry.Reason != "rate_limited" {
-		t.Fatalf("unexpected 429 ban entry: %#v", entry)
-	}
-	if entry.Phase != phaseIsolated {
-		t.Fatalf("phase=%s", entry.Phase)
+	if normalizePhase(entry.Phase) != phaseCooling || entry.Cycle != 1 {
+		t.Fatalf("entry=%#v", entry)
 	}
 }
 
@@ -277,7 +255,7 @@ func TestStateReloadKeepsPendingReenable(t *testing.T) {
 	}
 	now := time.Now()
 	first.set("persisted-auth", banEntry{AuthIndex: "idx-persisted", StatusCode: 402, Reason: "payment_required", BannedAt: now, ResetAt: now.Add(time.Hour)})
-	first.finishAction(banAction{AuthID: "persisted-auth", AuthIndex: "idx-persisted", Disabled: true}, nil, now, time.Minute, false, 0, 0)
+	first.finishAction(banAction{AuthID: "persisted-auth", AuthIndex: "idx-persisted", Disabled: true}, nil, now, time.Minute)
 
 	second := newBanState()
 	if err := second.configure(stateFile); err != nil {
@@ -484,7 +462,7 @@ func TestBuildExportBundleAndCSV(t *testing.T) {
 	bans.set("export-a", banEntry{
 		AuthIndex: "idx-a", StatusCode: 403, Class: classPermission, Reason: "permission_denied",
 		BannedAt: now.Add(-2 * time.Hour), ResetAt: now.Add(2 * time.Hour),
-		Phase: phaseIsolated, UnusableSince: now.Add(-2 * time.Hour),
+		Phase: phaseCooling, UnusableSince: now.Add(-2 * time.Hour),
 	})
 	// minimal controller so config() works
 	if autoban == nil {

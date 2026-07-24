@@ -49,7 +49,7 @@ func (c *autobanController) configure(raw []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := c.state.configure(cfg.StateFile); err != nil {
+	if err := c.state.configureWithMaxCycles(cfg.StateFile, cfg.maxAutoCycles()); err != nil {
 		return fmt.Errorf("加载状态文件失败: %w", err)
 	}
 	c.mu.Lock()
@@ -75,8 +75,6 @@ func (c *autobanController) status() controllerStatus {
 	return controllerStatus{ManagementURL: c.cfg.ManagementURL, LastError: c.lastError, BlockedUntil: c.blockedUntil}
 }
 
-// clientSnapshot returns the Management API client for read-only list operations
-// (e.g. pie chart pool size). May be nil if not configured.
 func (c *autobanController) clientSnapshot() *managementClient {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -88,18 +86,15 @@ func (c *autobanController) handleUsage(record pluginapi.UsageRecord) {
 	if !cfg.Enabled || record.AuthID == "" {
 		return
 	}
-	// Only act on xAI provider records when provider is populated.
 	if record.Provider != "" && !strings.EqualFold(record.Provider, providerXAI) {
 		return
 	}
 	now := time.Now()
 
-	// Success path: debt decay + half-open trial progress (even when not failed).
 	if !record.Failed {
-		if graduated := c.state.applySuccess(record.AuthID, now, cfg); graduated {
-			slog.Info("xai-autoban: trial graduated to healthy", "auth_id", record.AuthID)
+		if cleared := c.state.applySuccess(record.AuthID, now, cfg); cleared {
+			slog.Info("xai-autoban: cycle ledger cleared after success", "auth_id", record.AuthID)
 		}
-		// Timed-out trials are re-isolated on the worker tick.
 		return
 	}
 
@@ -111,29 +106,34 @@ func (c *autobanController) handleUsage(record pluginapi.UsageRecord) {
 	isolated, entered := c.state.applyFailure(record.AuthID, record.AuthIndex, record.Failure.StatusCode, cls, now, cfg)
 	if entered {
 		entry := c.state.lookup([]string{record.AuthID})[record.AuthID]
-		slog.Warn("xai-autoban: credential isolated (hard, time-bounded)",
+		slog.Warn("xai-autoban: credential entered cool-down",
 			"auth_id", record.AuthID,
 			"status", record.Failure.StatusCode,
 			"class", cls.Class,
 			"reason", cls.Reason,
-			"step", entry.Step,
-			"debt", entry.DebtScore,
-			"reset_at", entry.ResetAt.Format(time.RFC3339),
+			"phase", entry.Phase,
+			"cycle", entry.Cycle,
+			"reset_at", formatTimeOrEmpty(entry.ResetAt),
 		)
 		c.signal()
 		return
 	}
 	if isolated {
-		// Already isolated; evidence refreshed.
 		c.signal()
 		return
 	}
-	slog.Info("xai-autoban: failure recorded without isolation",
+	slog.Info("xai-autoban: failure ignored (not handled)",
 		"auth_id", record.AuthID,
 		"status", record.Failure.StatusCode,
 		"class", cls.Class,
-		"reason", cls.Reason,
 	)
+}
+
+func formatTimeOrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 func (c *autobanController) requestRelease(authIDs []string) int {
@@ -187,11 +187,6 @@ func (c *autobanController) process() {
 	now := time.Now()
 	cfg := c.config()
 
-	// Half-open zombie trials → stepped re-isolation.
-	if n := c.state.reisolateTimedOutTrials(now, cfg); n > 0 {
-		slog.Warn("xai-autoban: re-isolated timed-out trial accounts", "count", n)
-	}
-
 	c.mu.RLock()
 	blockedUntil := c.blockedUntil
 	c.mu.RUnlock()
@@ -223,7 +218,7 @@ func (c *autobanController) process() {
 			c.lastError = err.Error()
 			c.mu.Unlock()
 		}
-		c.state.finishAction(action, err, attemptedAt, retryInterval, cfg.HalfOpenEnabled, cfg.TrialMaxDuration, cfg.HalfOpenSuccessThreshold)
+		c.state.finishAction(action, err, attemptedAt, retryInterval)
 		if err != nil {
 			slog.Error("xai-autoban: management status update failed",
 				"auth_id", action.AuthID,
@@ -240,17 +235,12 @@ func (c *autobanController) process() {
 		c.mu.Unlock()
 		if action.Disabled {
 			slog.Warn("xai-autoban: credential disabled through Management API", "auth_id", action.AuthID)
-		} else if cfg.HalfOpenEnabled {
-			slog.Info("xai-autoban: credential re-enabled; entered half-open trial", "auth_id", action.AuthID)
 		} else {
 			slog.Info("xai-autoban: credential re-enabled through Management API", "auth_id", action.AuthID)
 		}
 	}
 }
 
-// deleteCredentials permanently removes auth files for the given IDs via Management API.
-// When statusCode > 0, only entries currently tracked with that HTTP status are deleted
-// (upstream behavior: permanent delete is for 403). Unlike release/unban, this does not re-enable.
 func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) (int, error) {
 	ids := make([]string, 0, len(authIDs))
 	for _, id := range authIDs {
@@ -317,7 +307,6 @@ func (c *autobanController) deleteCredentials(authIDs []string, statusCode int) 
 	return deleted, firstErr
 }
 
-// deleteByStatus permanently deletes all tracked credentials with the given HTTP status (upstream: 403).
 func (c *autobanController) deleteByStatus(statusCode int) (int, error) {
 	if statusCode <= 0 {
 		return 0, fmt.Errorf("invalid status code")

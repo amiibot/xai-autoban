@@ -43,7 +43,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.4.3"
+	pluginVersion = "1.5.0"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -157,16 +157,12 @@ func pluginRegistration() registration {
 				{Name: "management-url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management-key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA Management Key；优先于环境变量。"},
 				{Name: "management-key-env", Type: pluginapi.ConfigFieldTypeString, Description: "Management Key 环境变量名，默认 CPA_MANAGEMENT_KEY。"},
-				{Name: "disable-hours", Type: pluginapi.ConfigFieldTypeInteger, Description: "隔离时长上限（小时），默认 24；实际隔离取阶梯冷却与该上限的较小值。"},
-				{Name: "status-codes", Type: pluginapi.ConfigFieldTypeArray, Description: "触发证据/隔离的 HTTP 状态码，默认 401、402、403、429。"},
-				{Name: "state-file", Type: pluginapi.ConfigFieldTypeString, Description: "自动恢复状态文件，默认 xai-autoban-state.json。"},
+				{Name: "disable-hours", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却时长（小时），默认 24；也是 class 上限回退。"},
+				{Name: "status-codes", Type: pluginapi.ConfigFieldTypeArray, Description: "失败即冷却的 HTTP 状态码，默认 401、402、403、429。"},
+				{Name: "state-file", Type: pluginapi.ConfigFieldTypeString, Description: "状态文件，默认 xai-autoban-state.json。"},
 				{Name: "classify-body", Type: pluginapi.ConfigFieldTypeString, Description: "是否解析失败 body 做细分类，默认 true。"},
-				{Name: "debt-enabled", Type: pluginapi.ConfigFieldTypeString, Description: "是否启用失败债务累计，默认 true（permission 仍一次硬隔离但带 TTL）。"},
-				{Name: "debt-threshold", Type: pluginapi.ConfigFieldTypeString, Description: "债务达到此值触发硬隔离，默认 2.0。"},
-				{Name: "streak-threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "归因连败次数触发硬隔离，默认 3。"},
-				{Name: "half-open-enabled", Type: pluginapi.ConfigFieldTypeString, Description: "到期后是否进入半开试用，默认 true。"},
-				{Name: "half-open-success-threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "试用成功次数毕业，默认 2。"},
-				{Name: "cooldown-hours", Type: pluginapi.ConfigFieldTypeArray, Description: "阶梯冷却小时列表，默认 [6,12,24]。"},
+				{Name: "max-auto-cycles", Type: pluginapi.ConfigFieldTypeInteger, Description: "连续冷却轮次上限，达到后进待清理且不再自动启用，默认 3。"},
+				{Name: "cooldown-hours", Type: pluginapi.ConfigFieldTypeArray, Description: "可选按轮次阶梯小时；不配则固定 disable-hours。"},
 
 				{Name: "observe-usage", Type: pluginapi.ConfigFieldTypeString, Description: "是否内嵌读取 CPAMP usage.sqlite 做 24h 用量观测，默认 true（不依赖 grok-quota）。"},
 				{Name: "usage-db-path", Type: pluginapi.ConfigFieldTypeString, Description: "usage.sqlite 路径；空则自动探测。"},
@@ -184,7 +180,7 @@ func handleUsage(raw []byte) ([]byte, error) {
 	if len(raw) == 0 || json.Unmarshal(raw, &record) != nil {
 		return okEnvelope(map[string]any{})
 	}
-	// Success events needed for debt decay + half-open graduation.
+	// Success events clear consecutive cool-down cycle ledger while healthy.
 	if record.Provider != "" && !strings.EqualFold(record.Provider, providerXAI) {
 		return okEnvelope(map[string]any{})
 	}
@@ -389,7 +385,8 @@ type exportBundle struct {
 	ExportedAt    string                    `json:"exported_at"`
 	Status        statusInfo                `json:"status"`
 	StateBans     map[string]banEntry       `json:"state_bans"`
-	StateEvidence map[string]evidenceLedger `json:"state_evidence,omitempty"`
+	StateCycles   map[string]cycleLedger    `json:"state_cycles,omitempty"`
+	StateEvidence map[string]evidenceLedger `json:"state_evidence,omitempty"` // legacy empty
 	UsageAccounts []quotaAccountView        `json:"usage_accounts,omitempty"`
 	Notes         []string                  `json:"notes,omitempty"`
 }
@@ -397,7 +394,7 @@ type exportBundle struct {
 func buildExportBundle() exportBundle {
 	now := time.Now().UTC()
 	status := currentStatus()
-	bansMap, evidenceMap := bans.exportState()
+	bansMap, cyclesMap := bans.exportState()
 	cfg := autoban.config()
 	var usage []quotaAccountView
 	if cfg.ObserveUsage || cfg.JoinQuotaState {
@@ -443,7 +440,7 @@ func buildExportBundle() exportBundle {
 	}
 	notes := []string{
 		"status.bans: panel join view (isolation rows + usage fields)",
-		"state_bans/state_evidence: raw plugin state for offline analysis",
+		"state_bans/state_cycles: raw plugin state for offline analysis",
 		"usage_accounts: observed xAI accounts from usage.sqlite / quota state (not only banned)",
 		"observe-only fields never trigger ban decisions",
 	}
@@ -454,7 +451,7 @@ func buildExportBundle() exportBundle {
 		ExportedAt:    now.Format(time.RFC3339),
 		Status:        status,
 		StateBans:     bansMap,
-		StateEvidence: evidenceMap,
+		StateCycles:   cyclesMap,
 		UsageAccounts: usage,
 		Notes:         notes,
 	}
@@ -505,10 +502,9 @@ func bansCSV(items []banInfo) ([]byte, error) {
 	buf.Write([]byte{0xEF, 0xBB, 0xBF})
 	w := csv.NewWriter(&buf)
 	header := []string{
-		"auth_id", "auth_index", "status_code", "class", "reason", "phase", "step",
-		"debt_score", "streak", "trial_successes",
+		"auth_id", "auth_index", "status_code", "class", "reason", "phase", "cycle",
 		"banned_at", "reset_at", "remaining_seconds", "unusable_since", "offline_hours",
-		"last_used", "tokens_24h", "quota_limit", "quota_email", "quota_health",
+		"last_used", "tokens_24h", "tokens_total", "quota_limit", "quota_email", "quota_health",
 		"management_disabled", "last_error", "deletable",
 	}
 	if err := w.Write(header); err != nil {
@@ -530,10 +526,7 @@ func bansCSV(items []banInfo) ([]byte, error) {
 			b.Class,
 			b.Reason,
 			b.Phase,
-			strconv.Itoa(b.Step),
-			strconv.FormatFloat(b.DebtScore, 'f', 3, 64),
-			strconv.Itoa(b.Streak),
-			strconv.Itoa(b.TrialSuccesses),
+			strconv.Itoa(b.Cycle),
 			b.BannedAt,
 			b.ResetAt,
 			strconv.FormatInt(b.RemainingSeconds, 10),
@@ -541,6 +534,7 @@ func bansCSV(items []banInfo) ([]byte, error) {
 			strconv.FormatInt(b.OfflineHours, 10),
 			b.LastUsed,
 			strconv.FormatInt(b.Tokens24h, 10),
+			strconv.FormatInt(b.TokensTotal, 10),
 			strconv.FormatInt(b.QuotaLimit, 10),
 			b.QuotaEmail,
 			b.QuotaHealth,
@@ -593,12 +587,12 @@ type statusInfo struct {
 	// NormalCount is currently not banned (and not disabled, when known).
 	NormalCount      int      `json:"normal_count"`
 	DeletableClasses []string `json:"deletable_classes"`
-	// HalfOpenSuccessThreshold is the configured trial graduation count (panel label).
-	HalfOpenSuccessThreshold int                  `json:"half_open_success_threshold"`
-	Charts                   chartBundle          `json:"charts"`
-	QuotaJoin                quotaJoinInfo        `json:"quota_join"`
-	Management               managementStatusInfo `json:"management"`
-	Bans                     []banInfo            `json:"bans"`
+	// MaxAutoCycles is cool-down rounds before pending cleanup (panel label).
+	MaxAutoCycles int                  `json:"max_auto_cycles"`
+	Charts        chartBundle          `json:"charts"`
+	QuotaJoin     quotaJoinInfo        `json:"quota_join"`
+	Management    managementStatusInfo `json:"management"`
+	Bans          []banInfo            `json:"bans"`
 }
 
 type chartBundle struct {
@@ -634,35 +628,30 @@ type managementStatusInfo struct {
 }
 
 type banInfo struct {
-	AuthID             string  `json:"auth_id"`
-	AuthIndex          string  `json:"auth_index,omitempty"`
-	StatusCode         int     `json:"status_code"`
-	Class              string  `json:"class,omitempty"`
-	Reason             string  `json:"reason"`
-	BodyFingerprint    string  `json:"body_fingerprint,omitempty"`
-	BannedAt           string  `json:"banned_at"`
-	ResetAt            string  `json:"reset_at"`
-	RemainingSeconds   int64   `json:"remaining_seconds"`
-	ManagementDisabled bool    `json:"management_disabled"`
-	Deletable          bool    `json:"deletable"`
-	LastError          string  `json:"last_error,omitempty"`
-	Phase              string  `json:"phase,omitempty"`
-	Step               int     `json:"step,omitempty"`
-	DebtScore          float64 `json:"debt_score,omitempty"`
-	Streak             int     `json:"streak,omitempty"`
-	TrialSuccesses     int     `json:"trial_successes,omitempty"`
-	// Optional rolling-24h usage join (observe only; never pre-ban).
-	Tokens24h   int64  `json:"tokens_24h"`
-	QuotaLimit  int64  `json:"quota_limit,omitempty"`
-	QuotaHealth string `json:"quota_health,omitempty"`
-	QuotaEmail  string `json:"quota_email,omitempty"`
-	OverRef     bool   `json:"over_reference,omitempty"`
-	// LastUsed: latest successful xAI usage from usage.sqlite (observe only).
-	LastUsed string `json:"last_used,omitempty"`
-	// UnusableSince: first isolation of current outage spell (survives step-up).
+	AuthID             string `json:"auth_id"`
+	AuthIndex          string `json:"auth_index,omitempty"`
+	StatusCode         int    `json:"status_code"`
+	Class              string `json:"class,omitempty"`
+	Reason             string `json:"reason"`
+	BodyFingerprint    string `json:"body_fingerprint,omitempty"`
+	BannedAt           string `json:"banned_at"`
+	ResetAt            string `json:"reset_at"`
+	RemainingSeconds   int64  `json:"remaining_seconds"`
+	ManagementDisabled bool   `json:"management_disabled"`
+	Deletable          bool   `json:"deletable"`
+	LastError          string `json:"last_error,omitempty"`
+	Phase              string `json:"phase,omitempty"` // cooling | pending
+	Cycle              int    `json:"cycle,omitempty"`
+	// Optional usage join (observe only; never pre-ban).
+	Tokens24h     int64  `json:"tokens_24h"`
+	TokensTotal   int64  `json:"tokens_total,omitempty"` // lifetime successful tokens
+	QuotaLimit    int64  `json:"quota_limit,omitempty"`
+	QuotaHealth   string `json:"quota_health,omitempty"`
+	QuotaEmail    string `json:"quota_email,omitempty"`
+	OverRef       bool   `json:"over_reference,omitempty"`
+	LastUsed      string `json:"last_used,omitempty"`
 	UnusableSince string `json:"unusable_since,omitempty"`
-	// OfflineHours: floor hours since UnusableSince (or BannedAt fallback). Panel "已下线(h)".
-	OfflineHours int64 `json:"offline_hours"`
+	OfflineHours  int64  `json:"offline_hours"`
 }
 
 const (
@@ -694,10 +683,6 @@ func currentStatus() statusInfo {
 	matched := 0
 	bannedKeys := map[string]struct{}{}
 	for id, entry := range snapshot {
-		remaining := int64(entry.ResetAt.Sub(now).Seconds())
-		if remaining < 0 {
-			remaining = 0
-		}
 		class := entry.Class
 		if class == "" {
 			class = classLegacy
@@ -720,13 +705,25 @@ func currentStatus() statusInfo {
 			}
 			offlineHours = h
 		}
+		remaining := int64(0)
+		if !entry.ResetAt.IsZero() {
+			remaining = int64(entry.ResetAt.Sub(now).Seconds())
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
 		info := banInfo{
 			AuthID: id, AuthIndex: entry.AuthIndex, StatusCode: entry.StatusCode, Class: class, Reason: entry.Reason,
-			BodyFingerprint: entry.BodyFingerprint, BannedAt: entry.BannedAt.Format(time.RFC3339),
-			ResetAt: entry.ResetAt.Format(time.RFC3339), RemainingSeconds: remaining,
+			BodyFingerprint:    entry.BodyFingerprint,
+			RemainingSeconds:   remaining,
 			ManagementDisabled: entry.ManagementDisabled, Deletable: entry.StatusCode == 403, LastError: entry.LastError,
-			Phase: normalizePhase(entry.Phase), Step: entry.Step, DebtScore: entry.DebtScore, Streak: entry.Streak,
-			TrialSuccesses: entry.TrialSuccesses, OfflineHours: offlineHours,
+			Phase: normalizePhase(entry.Phase), Cycle: entry.Cycle, OfflineHours: offlineHours,
+		}
+		if !entry.BannedAt.IsZero() {
+			info.BannedAt = entry.BannedAt.Format(time.RFC3339)
+		}
+		if !entry.ResetAt.IsZero() {
+			info.ResetAt = entry.ResetAt.Format(time.RFC3339)
 		}
 		if !unusableSince.IsZero() {
 			info.UnusableSince = unusableSince.Format(time.RFC3339)
@@ -738,6 +735,7 @@ func currentStatus() statusInfo {
 				if info.Tokens24h == 0 {
 					info.Tokens24h = q.QuotaUsed
 				}
+				info.TokensTotal = q.TokensTotal
 				info.QuotaLimit = q.QuotaLimit
 				info.QuotaHealth = firstNonEmpty(q.QuotaHealth, q.StatusKind)
 				info.QuotaEmail = q.Email
@@ -782,14 +780,10 @@ func currentStatus() statusInfo {
 	if poolTotal < len(items) {
 		poolTotal = len(items)
 	}
-	threshold := cfg.HalfOpenSuccessThreshold
-	if threshold <= 0 {
-		threshold = 2
-	}
 	return statusInfo{
 		Plugin: pluginName, Version: pluginVersion, Count: len(items),
 		PoolTotal: poolTotal, NormalCount: normalCount,
-		DeletableClasses: []string{}, HalfOpenSuccessThreshold: threshold,
+		DeletableClasses: []string{}, MaxAutoCycles: cfg.maxAutoCycles(),
 		Charts: charts, QuotaJoin: qinfo,
 		Management: management, Bans: items,
 	}
@@ -959,7 +953,7 @@ func statusPage() string {
     main{max-width:1440px;margin:auto;padding:20px 24px 36px}.stats{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:12px;margin-bottom:16px}.stat{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:16px;box-shadow:var(--shadow)}.stat-label{font-size:12px;color:var(--muted);font-weight:600}.stat-value{font-size:28px;line-height:1.1;font-weight:750;margin-top:7px}.stat-total{border-left:4px solid var(--blue)}.stat-401{border-left:4px solid #1570ef}.stat-402{border-left:4px solid #f79009}.stat-403{border-left:4px solid #d92d20}.stat-429{border-left:4px solid #7f56d9}
     .toolbar{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);margin-bottom:14px}.toolbar-row{display:flex;align-items:center;gap:10px;padding:12px;flex-wrap:wrap}.toolbar-row+.toolbar-row{border-top:1px solid var(--line)}input[type=search]{height:36px;min-width:260px;flex:1;border:1px solid #bfc8d2;border-radius:6px;padding:0 11px;background:#fff;color:var(--text);font-size:14px}.segments{display:flex;border:1px solid #bfc8d2;border-radius:6px;overflow:hidden}.segments button{border:0;border-right:1px solid #bfc8d2;border-radius:0;background:#fff;color:#344054}.segments button:last-child{border-right:0}.segments button.active{background:#e8eef6;color:#101828;font-weight:700}
     button{height:36px;border:1px solid #bfc8d2;border-radius:6px;background:#fff;color:#273240;padding:0 12px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}button:hover{background:#f2f4f7}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.primary:hover{background:#164ca7}.danger{color:#b42318;border-color:#f1a39b;background:#fff}.danger:hover{background:var(--red-bg)}.quiet-danger{color:#b42318}.spacer{flex:1}.auto{display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.auto input{width:16px;height:16px}.message{min-height:20px;color:var(--muted);font-size:13px}.message.error{color:var(--red)}
-    .table-shell{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);overflow:hidden}.table-head{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.table-head strong{font-size:14px}.table-head span{color:var(--muted);font-size:13px}.table-wrap{overflow:auto;max-height:64vh}table{border-collapse:collapse;width:100%;min-width:1280px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #edf0f3;vertical-align:middle}th{position:sticky;top:0;background:#f8fafb;color:#475467;font-size:12px;font-weight:700;z-index:1}tbody tr:hover{background:#f9fbfc}td code{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;color:#344054}.check{width:38px;text-align:center}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:24px;border-radius:12px;font-weight:750;font-size:12px}.b401{color:#175cd3;background:#eff8ff}.b402{color:var(--amber);background:var(--amber-bg)}.b403{color:var(--red);background:var(--red-bg)}.b429{color:#6941c6;background:#f4f3ff}.reason{color:#475467}.time{white-space:nowrap}.remaining{font-variant-numeric:tabular-nums;font-weight:650}.management-ok{color:var(--green);font-weight:650}.management-pending{color:var(--amber);font-weight:650}.management-error{color:var(--red);font-weight:650}.row-action{height:30px;padding:0 9px;font-size:12px}.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.empty{padding:52px;text-align:center;color:var(--muted)}
+    .table-shell{background:var(--surface);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);overflow:hidden}.table-head{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.table-head strong{font-size:14px}.table-head span{color:var(--muted);font-size:13px}.table-wrap{overflow:auto;max-height:64vh}table{border-collapse:collapse;width:100%;min-width:1280px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #edf0f3;vertical-align:middle}th{position:sticky;top:0;background:#f8fafb;color:#475467;font-size:12px;font-weight:700;z-index:1}th.sortable{cursor:pointer;user-select:none}th.sortable:hover{color:#101828}th.sortable.sorted-asc::after{content:" \25B2";font-size:10px;opacity:.7}th.sortable.sorted-desc::after{content:" \25BC";font-size:10px;opacity:.7}tbody tr:hover{background:#f9fbfc}td code{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;color:#344054}.check{width:38px;text-align:center}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:24px;border-radius:12px;font-weight:750;font-size:12px}.b401{color:#175cd3;background:#eff8ff}.b402{color:var(--amber);background:var(--amber-bg)}.b403{color:var(--red);background:var(--red-bg)}.b429{color:#6941c6;background:#f4f3ff}.reason{color:#475467}.time{white-space:nowrap}.remaining{font-variant-numeric:tabular-nums;font-weight:650}.management-ok{color:var(--green);font-weight:650}.management-pending{color:var(--amber);font-weight:650}.management-error{color:var(--red);font-weight:650}.row-action{height:30px;padding:0 9px;font-size:12px}.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.empty{padding:52px;text-align:center;color:var(--muted)}
     .tip{position:relative;cursor:help;border-bottom:1px dotted rgba(102,114,127,.45)}
     .tip[data-tip]:hover::after,.tip[data-tip]:focus::after{content:attr(data-tip);position:absolute;z-index:20;left:0;bottom:calc(100% + 8px);min-width:180px;max-width:320px;padding:8px 10px;border-radius:6px;background:#182230;color:#fff;font-size:12px;font-weight:500;line-height:1.45;white-space:pre-wrap;box-shadow:0 8px 24px rgba(16,24,40,.18);pointer-events:none}
     .tip[data-tip]:hover::before,.tip[data-tip]:focus::before{content:"";position:absolute;z-index:20;left:12px;bottom:calc(100% + 2px);border:6px solid transparent;border-top-color:#182230;pointer-events:none}
@@ -1024,23 +1018,24 @@ func statusPage() string {
     <section class="table-shell">
       <div class="table-head"><strong>隔离凭据</strong><span id="resultCount">0 条</span></div>
       <div class="table-wrap">
-        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th>Auth ID</th><th class="tip" data-tip="触发隔离的 HTTP 状态码">状态码</th><th class="tip" data-tip="根据失败 body 粗分类，用于展示与按类 TTL">失败类型</th><th class="tip" data-tip="近 24h token / 参考上限（只读，不预 ban）">24h用量 / 上限</th><th>原因</th><th class="tip" data-tip="本地隔离与 CPA Management 停用/启用/半开试用进度。悬停单元格可看详情。">当前处置</th><th class="tip" data-tip="usage.sqlite 最近一次成功请求时间">最后使用</th><th class="tip" data-tip="本轮连续不可用整小时数（unusable_since 起算）">已下线(h)</th><th class="tip" data-tip="本轮冷却剩余时长">剩余时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <table><thead><tr><th class="check"><input id="selectPage" type="checkbox" title="选择当前页"></th><th class="sortable" data-sort="auth_id">Auth ID</th><th class="sortable tip" data-sort="status_code" data-tip="触发冷却的 HTTP 状态码">状态码</th><th class="sortable tip" data-sort="class" data-tip="失败 body 粗分类 / class TTL">失败类型</th><th class="sortable tip" data-sort="tokens_total" data-tip="近24h / 参考上限 · Σ累计成功 token（只读）">用量 24h·累计</th><th>原因</th><th class="sortable tip" data-sort="phase" data-tip="冷却中 / 待清理 / 解禁进度">当前处置</th><th class="sortable tip" data-sort="last_used" data-tip="最近一次成功请求">最后使用</th><th class="sortable tip" data-sort="offline_hours" data-tip="连续不可用整小时">已下线(h)</th><th class="sortable tip" data-sort="remaining_seconds" data-tip="本轮冷却剩余">剩余时间</th><th class="sortable tip" data-sort="cycle" data-tip="冷却轮次">轮次</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
         <div id="empty" class="empty" hidden>当前筛选条件下没有隔离凭据</div>
       </div>
       <div class="pager"><div class="pager-info" id="range">0-0 / 0</div><div class="pager-buttons"><button id="prev" onclick="changePage(-1)">上一页</button><span class="page-number" id="pageNumber">1 / 1</span><button id="next" onclick="changePage(1)">下一页</button></div></div>
     </section>
-    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。「最后使用」= usage.sqlite 最近成功请求；「已下线(h)」= 本轮连续不可用起点至今的整小时数（阶梯再隔离不重置）。「剩余时间」= 本轮冷却剩余。永久删除仅 HTTP 403（删文件）。手动解禁跳过试用。可用「导出 JSON / CSV」下载当前统计做本地分析。</p>
+    <p class="footer-note">此页面无需管理密钥。硬隔离有期限（阶梯冷却 + 半开试用），不是永 ban。三态：冷却中 → 到期自动启用 → 再失败再冷却；达 max-auto-cycles 进「待清理」（不再自动启用）。「用量」含 24h 与累计 Σ。「已下线(h)」自首次冷却起算。表头可排序。永久删除仅 HTTP 403。</p>
   </main>
   <script>
     const base=window.location.pathname.replace(/\/status\/?$/,'');
-    const state={bans:[],filter:'all',query:'',page:1,pageSize:50,selected:new Set(),timer:null,half_open_success_threshold:2};
+    const state={bans:[],filter:'all',query:'',page:1,pageSize:50,selected:new Set(),timer:null,max_auto_cycles:2};
     const $=id=>document.getElementById(id);
     const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     async function api(path){const response=await fetch(base+path,{cache:'no-store'});const text=await response.text();let data;try{data=JSON.parse(text)}catch(_){throw new Error(text||('HTTP '+response.status))}if(!response.ok)throw new Error(data.error||('HTTP '+response.status));return data}
     function setMessage(text,error=false){$('message').textContent=text;$('message').className='message'+(error?' error':'')}
     function counts(){const out={401:0,402:0,403:0,429:0};for(const ban of state.bans)if(out[ban.status_code]!==undefined)out[ban.status_code]++;return out}
-    function filtered(){const q=state.query.toLowerCase();return state.bans.filter(ban=>(state.filter==='all'||String(ban.status_code)===state.filter)&&(!q||ban.auth_id.toLowerCase().includes(q)||ban.reason.toLowerCase().includes(q)))}
+    function filtered(){const q=state.query.toLowerCase();let list=state.bans.filter(ban=>(state.filter==='all'||String(ban.status_code)===state.filter)&&(!q||ban.auth_id.toLowerCase().includes(q)||(ban.reason||'').toLowerCase().includes(q)||(ban.class||'').toLowerCase().includes(q)||(ban.phase||'').toLowerCase().includes(q)));const key=state.sortKey||'offline_hours';const dir=state.sortDir==='asc'?1:-1;const numKeys={status_code:1,tokens_24h:1,tokens_total:1,offline_hours:1,remaining_seconds:1,cycle:1};list=list.slice().sort((a,b)=>{let va=a[key],vb=b[key];if(key==='tokens_total'){va=Number(a.tokens_total||0);vb=Number(b.tokens_total||0)}else if(numKeys[key]){va=Number(va||0);vb=Number(vb||0)}else{va=String(va??'');vb=String(vb??'')}if(va<vb)return -1*dir;if(va>vb)return 1*dir;return String(a.auth_id).localeCompare(String(b.auth_id))});return list}
+    function setSort(key){if(state.sortKey===key){state.sortDir=state.sortDir==='asc'?'desc':'asc'}else{state.sortKey=key;state.sortDir=(key==='auth_id'||key==='class'||key==='phase'||key==='last_used')?'asc':'desc'}state.page=1;document.querySelectorAll('th.sortable').forEach(th=>{th.classList.remove('sorted-asc','sorted-desc');if(th.dataset.sort===state.sortKey)th.classList.add(state.sortDir==='asc'?'sorted-asc':'sorted-desc')});render()}
     function formatDate(value){const d=new Date(value);return Number.isNaN(d.getTime())?value:d.toLocaleString('zh-CN',{hour12:false})}
     function formatRemaining(seconds){seconds=Math.max(0,Number(seconds||0));const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);if(d)return d+'天 '+h+'小时';if(h)return h+'小时 '+m+'分';return m+'分钟'}
     function formatLastUsed(value){if(!value)return '—';const d=new Date(value);return Number.isNaN(d.getTime())?String(value):d.toLocaleString('zh-CN',{hour12:false})}
@@ -1051,23 +1046,14 @@ func statusPage() string {
     function remainTip(ban){return '本轮冷却剩余：'+formatRemaining(ban.remaining_seconds)+'\n计划解禁：'+(ban.reset_at?formatDate(ban.reset_at):'—')+'\n（不等于已下线时长）';}
     function reasonLabel(reason){return {payment_required:'无额度或无订阅',forbidden:'上游拒绝访问',unauthorized:'凭据未授权',rate_limited:'请求频率受限',rate_limited_fallback:'限流（默认冷却）'}[reason]||reason}
     function managementState(ban){
-      const step=Number(ban.step||0);
-      const debt=Number(ban.debt_score||0);
+      const cycle=Number(ban.cycle||0);
+      const maxN=Number(state.max_auto_cycles||3)||3;
       const rem=formatRemaining(ban.remaining_seconds);
       const extras=[];
-      if(step>0)extras.push('冷却阶梯 step='+step+'（0=6h / 1=12h / 2+=24h，受 class TTL 上限约束）');
-      if(debt>0)extras.push('债务 debt='+debt.toFixed(1));
+      if(cycle>0)extras.push('冷却轮次 '+cycle+' / 上限 '+maxN);
       if(ban.unusable_since)extras.push('连续不可用自 '+formatDate(ban.unusable_since));
       const tail=extras.length?('\n'+extras.join('\n')):'';
-      if(ban.phase==='trial'){
-        const t=Number(ban.trial_successes||0);
-        const need=Number(state.half_open_success_threshold||2)||2;
-        return {
-          label:'半开试用 '+t+'/'+need,
-          className:'management-pending',
-          title:'半开试用：冷却到期后已重新启用，正在探活。\n成功 '+t+' / 需 '+need+' 次后恢复正常调度。\n失败会再隔离并加长冷却。\n试用截止：'+(ban.reset_at?formatDate(ban.reset_at):'—')+tail
-        };
-      }
+      const phase=String(ban.phase||'cooling');
       if(ban.last_error){
         const retryingDisable=!ban.management_disabled;
         return {
@@ -1076,26 +1062,36 @@ func statusPage() string {
           title:(retryingDisable?'Management 停用失败，将自动重试。':'Management 启用失败，将自动重试。')+'\n错误：'+String(ban.last_error||'')+tail
         };
       }
+      if(phase==='pending'||phase==='pending_cleanup'){
+        return {
+          label:'待清理',
+          className:'management-error',
+          title:'已达自动冷却上限（'+cycle+'/'+maxN+'）。插件不再自动启用。\n可手动解禁，或对 403 永久删除。'+tail
+        };
+      }
       if(ban.management_disabled){
         if(Number(ban.remaining_seconds)>0){
-          return {label:'已停用',className:'management-ok',title:'CPA 侧已标记 disabled，调度不会选用。\n本轮剩余冷却：'+rem+'\n计划解禁：'+(ban.reset_at?formatDate(ban.reset_at):'—')+tail};
+          return {label:'冷却中',className:'management-ok',title:'CPA 已 disabled，调度跳过。\n本轮剩余：'+rem+'\n计划解禁：'+(ban.reset_at?formatDate(ban.reset_at):'—')+tail};
         }
-        return {label:'解禁中',className:'management-pending',title:'冷却已到，正在调用 Management 重新启用该凭据。'+tail};
+        return {label:'解禁中',className:'management-pending',title:'冷却已到，正在调用 Management 重新启用。'+tail};
       }
-      return {label:'隔离中·待停用',className:'management-pending',title:'本地已从调度剔除。\n尚未在 CPA 侧成功标记 disabled（或等待后台写入）。\n本轮剩余：'+rem+tail};
+      return {label:'冷却中·待停用',className:'management-pending',title:'本地已跳过调度，等待 CPA disable。\n本轮剩余：'+rem+tail};
     }
 
-    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.half_open_success_threshold=Number(data.half_open_success_threshold||2)||2;state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
+    async function loadData
+
+    async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.max_auto_cycles=Number(data.max_auto_cycles||2)||2;state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
 
     const STATUS_COLORS={'ok':'#12b76a','disabled':'#98a2b3','401':'#1570ef','402':'#f79009','403':'#d92d20','429':'#7f56d9'};
     const CLASS_COLORS={ok:'#12b76a',auth:'#1570ef',payment:'#f79009',quota_paid:'#dc6803',quota_free:'#e04f16',permission:'#d92d20',rate_limit:'#7f56d9',forbidden_unknown:'#667085',other:'#98a2b3',legacy:'#d0d5dd'};
     function colorForStatus(key){return STATUS_COLORS[String(key)]||'#98a2b3'}
     function colorForClass(key){return CLASS_COLORS[key]||'#98a2b3'}
-    function formatTokens(ban){if(!ban)return '—';const tokens=Number(ban.tokens_24h||0);const lim=Number(ban.quota_limit||0);const hasUsage=lim>0||tokens>0||ban.over_reference;const joined=hasUsage||Boolean(ban.quota_health);if(!joined)return '—';const m=(tokens/1e6).toFixed(2);let s=m+'M';if(lim>0)s+=' / '+(lim/1e6).toFixed(2)+'M';else s+=' / 2.00M';if(ban.over_reference)s+=' ↑';return s}
+    function formatTokens(ban){if(!ban)return '—';const tokens=Number(ban.tokens_24h||0);const total=Number(ban.tokens_total||0);const lim=Number(ban.quota_limit||0);const hasUsage=lim>0||tokens>0||total>0||ban.over_reference;const joined=hasUsage||Boolean(ban.quota_health)||total>0;if(!joined)return '—';const fmt=n=>(Number(n)/1e6).toFixed(2)+'M';let s=fmt(tokens);if(lim>0)s+=' / '+fmt(lim);else if(tokens>0||total>0)s+=' / 2.00M';if(total>0)s+=' · Σ'+fmt(total);if(ban.over_reference)s+=' ↑';return s}
+    function tokensTip(ban){const t24=Number(ban.tokens_24h||0),tot=Number(ban.tokens_total||0);return '近24h：'+(t24/1e6).toFixed(3)+'M token\n累计成功：'+(tot/1e6).toFixed(3)+'M token\n来源：usage.sqlite（只读）';}
     function updateQuotaNote(){const q=state.quota_join||{},el=$('quotaNote');if(!el)return;if(!q.enabled){el.className='quota-note';el.textContent='用量观测：已关闭（observe-usage / join-quota-state）';return}if(q.ok){el.className='quota-note ok';const src=q.source==='usage_sqlite'?'内嵌 usage.sqlite':(q.source||'state');el.textContent='用量观测：已连接 ['+src+'] '+(q.path||'')+' · 命中隔离行 '+Number(q.matched||0)+' · 池约 '+Number(state.pool_total||q.pool_accounts||0)+'（只读，不预 ban）';return}el.className='quota-note warn';el.textContent='用量观测：未连接（'+(q.error||'找不到 usage.sqlite')+'）。可配置 usage-db-path / XAI_AUTOBAN_USAGE_DB 或 CPAMP_USAGE_DB'}
     function drawPie(pieId,legendId,slices,colorFn){const pie=$(pieId),legend=$(legendId);if(!pie||!legend)return;const data=(slices||[]).filter(s=>Number(s.count)>0);const total=data.reduce((a,s)=>a+Number(s.count),0);legend.innerHTML='';if(!total){pie.className='pie empty';pie.style.background='';pie.textContent='无数据';return}pie.className='pie';pie.textContent='';let angle=0;const parts=[];for(const s of data){const c=colorFn(s.key);const deg=Number(s.count)/total*360;parts.push(c+' '+angle+'deg '+(angle+deg)+'deg');angle+=deg;const row=document.createElement('div');row.className='legend-row';row.innerHTML='<span class="swatch" style="background:'+c+'"></span><span class="legend-label">'+esc(s.label||s.key)+'</span><span class="legend-count">'+Number(s.count).toLocaleString()+' · '+(100*Number(s.count)/total).toFixed(1)+'%</span>';legend.appendChild(row)}pie.style.background='conic-gradient('+parts.join(',')+')'}
     function drawCharts(){const c=state.charts||{};drawPie('pieStatus','legendStatus',c.by_status||[],colorForStatus);drawPie('pieClass','legendClass',c.by_class||[],colorForClass);const sub=document.querySelectorAll('.chart-sub');if(sub[0]&&c.pool_source){sub[0].textContent='池来源: '+(c.pool_source||'')+(c.includes_normal?' · 含正常号':' · 仅隔离号')}}
-    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+' tip" data-tip="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time tip" data-tip="'+esc(lastUsedTip(ban))+'">'+esc(formatLastUsed(ban.last_used))+'</td><td class="remaining tip" data-tip="'+esc(offlineTip(ban))+'">'+esc(formatOfflineHours(ban.offline_hours))+'</td><td class="remaining tip" data-tip="'+esc(remainTip(ban))+'">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
+    function render(){const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.pageSize));state.page=Math.min(state.page,pages);const start=(state.page-1)*state.pageSize;const pageRows=list.slice(start,start+state.pageSize);$('rows').innerHTML=pageRows.map(ban=>{const management=managementState(ban);const actions='<button class="row-action" data-unban="'+esc(ban.auth_id)+'">解禁</button>'+(ban.status_code===403?' <button class="row-action danger" data-delete="'+esc(ban.auth_id)+'">删除账号</button>':'');return '<tr><td class="check"><input type="checkbox" data-id="'+esc(ban.auth_id)+'" '+(state.selected.has(ban.auth_id)?'checked':'')+'></td><td><code>'+esc(ban.auth_id)+'</code></td><td><span class="badge b'+ban.status_code+'">'+ban.status_code+'</span></td><td class="reason"><code>'+esc(ban.class||'legacy')+'</code></td><td class="remaining tip" data-tip="'+esc(tokensTip(ban))+'">'+esc(formatTokens(ban))+'</td><td class="reason">'+esc(reasonLabel(ban.reason))+'</td><td class="'+management.className+' tip" data-tip="'+esc(management.title)+'">'+esc(management.label)+'</td><td class="time tip" data-tip="'+esc(lastUsedTip(ban))+'">'+esc(formatLastUsed(ban.last_used))+'</td><td class="remaining tip" data-tip="'+esc(offlineTip(ban))+'">'+esc(formatOfflineHours(ban.offline_hours))+'</td><td class="remaining tip" data-tip="'+esc(remainTip(ban))+'">'+esc(formatRemaining(ban.remaining_seconds))+'</td><td class="remaining">'+esc(String(ban.cycle||0))+'</td><td class="actions">'+actions+'</td></tr>'}).join('');$('empty').hidden=pageRows.length>0;$('resultCount').textContent=list.length.toLocaleString()+' 条';$('range').textContent=(list.length?start+1:0)+'-'+Math.min(start+state.pageSize,list.length)+' / '+list.length;$('pageNumber').textContent=state.page+' / '+pages;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;$('unbanSelected').disabled=state.selected.size===0;$('unbanSelected').textContent='解禁已选 ('+state.selected.size+')';$('selectPage').checked=pageRows.length>0&&pageRows.every(x=>state.selected.has(x.auth_id));document.querySelectorAll('#rows input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{input.checked?state.selected.add(input.dataset.id):state.selected.delete(input.dataset.id);render()}));document.querySelectorAll('#rows [data-unban]').forEach(button=>button.addEventListener('click',()=>unbanOne(encodeURIComponent(button.dataset.unban))));document.querySelectorAll('#rows [data-delete]').forEach(button=>button.addEventListener('click',()=>deleteOne(encodeURIComponent(button.dataset.delete))))}
     function changePage(delta){state.page+=delta;render();document.querySelector('.table-wrap').scrollTop=0}
     async function runAction(params,question,successText){if(question&&!confirm(question))return;try{setMessage('正在执行操作...');const result=await api('/action?'+new URLSearchParams(params));state.selected.clear();const done=successText?successText(result):('操作完成，已解禁 '+(result.removed||0)+' 个凭据');setMessage(done);await loadData(true)}catch(error){setMessage(error.message,true)}}
     function unbanOne(encoded){const id=decodeURIComponent(encoded);runAction({op:'unban',auth_id:id},'确认解禁该凭据？\n'+id)}
@@ -1116,7 +1112,11 @@ func statusPage() string {
     $('selectPage').addEventListener('change',event=>{const list=filtered(),start=(state.page-1)*state.pageSize;for(const ban of list.slice(start,start+state.pageSize))event.target.checked?state.selected.add(ban.auth_id):state.selected.delete(ban.auth_id);render()});
     $('autoRefresh').addEventListener('change',configureAutoRefresh);
     function configureAutoRefresh(){if(state.timer)clearInterval(state.timer);state.timer=$('autoRefresh').checked?setInterval(()=>loadData(true),30000):null}
-    configureAutoRefresh();loadData();
+    configureAutoRefresh();
+    document.querySelectorAll('th.sortable').forEach(th=>th.addEventListener('click',()=>setSort(th.dataset.sort)));
+    // default sort indicator
+    document.querySelectorAll('th.sortable').forEach(th=>{if(th.dataset.sort===state.sortKey)th.classList.add(state.sortDir==='asc'?'sorted-asc':'sorted-desc')});
+    loadData();
   </script>
 </body>
 </html>`

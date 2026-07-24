@@ -5,3 +5,4 @@
 *.dll
 *.dylib
 .DS_Store
+data/

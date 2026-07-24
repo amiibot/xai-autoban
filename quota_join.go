@@ -14,6 +14,7 @@ type quotaAccountView struct {
 	AuthIndex   string `json:"auth_index"`
 	Email       string `json:"email,omitempty"`
 	Tokens24h   int64  `json:"tokens_24h"`
+	TokensTotal int64  `json:"tokens_total,omitempty"` // lifetime successful tokens
 	QuotaUsed   int64  `json:"quota_used"`
 	QuotaLimit  int64  `json:"quota_limit"`
 	QuotaHealth string `json:"quota_health,omitempty"`

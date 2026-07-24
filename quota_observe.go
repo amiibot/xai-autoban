@@ -28,13 +28,14 @@ var (
 )
 
 type usageAgg struct {
-	authIndex  string
-	email      string
-	authFile   string
-	tokens24h  int64
-	success24h int64
-	failed24h  int64
-	lastUsage  time.Time
+	authIndex   string
+	email       string
+	authFile    string
+	tokens24h   int64
+	tokensTotal int64
+	success24h  int64
+	failed24h   int64
+	lastUsage   time.Time
 }
 
 type coolingAgg struct {
@@ -142,6 +143,7 @@ func loadRollingUsage(db *sql.DB, now time.Time, window time.Duration) (map[stri
 			COALESCE(MAX(auth_file_snapshot), ''),
 			COALESCE(MAX(account_snapshot), ''),
 			COALESCE(SUM(CASE WHEN failed = 0 AND timestamp_ms >= ? THEN total_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed = 0 THEN total_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed = 0 AND timestamp_ms >= ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed = 1 AND timestamp_ms >= ? THEN 1 ELSE 0 END), 0),
 			COALESCE(MAX(CASE WHEN failed = 0 THEN timestamp_ms ELSE NULL END), 0)
@@ -157,8 +159,8 @@ func loadRollingUsage(db *sql.DB, now time.Time, window time.Duration) (map[stri
 	out := map[string]usageAgg{}
 	for rows.Next() {
 		var authIndex, authFile, account string
-		var tokens, success, failed, lastMS int64
-		if err := rows.Scan(&authIndex, &authFile, &account, &tokens, &success, &failed, &lastMS); err != nil {
+		var tokens, tokensTotal, success, failed, lastMS int64
+		if err := rows.Scan(&authIndex, &authFile, &account, &tokens, &tokensTotal, &success, &failed, &lastMS); err != nil {
 			return nil, err
 		}
 		authIndex = strings.TrimSpace(authIndex)
@@ -170,12 +172,13 @@ func loadRollingUsage(db *sql.DB, now time.Time, window time.Duration) (map[stri
 			continue
 		}
 		agg := usageAgg{
-			authIndex:  authIndex,
-			email:      deriveEmail(account, authFile),
-			authFile:   filepath.Base(strings.TrimSpace(authFile)),
-			tokens24h:  tokens,
-			success24h: success,
-			failed24h:  failed,
+			authIndex:   authIndex,
+			email:       deriveEmail(account, authFile),
+			authFile:    filepath.Base(strings.TrimSpace(authFile)),
+			tokens24h:   tokens,
+			tokensTotal: tokensTotal,
+			success24h:  success,
+			failed24h:   failed,
 		}
 		if lastMS > 0 {
 			agg.lastUsage = time.UnixMilli(lastMS).UTC()
@@ -364,14 +367,15 @@ func computeQuotaObserve(usageDBPath, authDir string) quotaJoinIndex {
 			tokens = 0
 		}
 		view := quotaAccountView{
-			AuthIndex:  authIndex,
-			Email:      email,
-			Tokens24h:  tokens,
-			QuotaUsed:  tokens,
-			QuotaLimit: dynamicLimit(tokens, defaultReferenceTokens),
-			Source:     sourceRollingUsage,
-			OverRef:    tokens > defaultReferenceTokens,
-			LastUsed:   u.lastUsage,
+			AuthIndex:   authIndex,
+			Email:       email,
+			Tokens24h:   tokens,
+			TokensTotal: u.tokensTotal,
+			QuotaUsed:   tokens,
+			QuotaLimit:  dynamicLimit(tokens, defaultReferenceTokens),
+			Source:      sourceRollingUsage,
+			OverRef:     tokens > defaultReferenceTokens,
+			LastUsed:    u.lastUsage,
 		}
 		if cool {
 			view.QuotaHealth = "cooldown"

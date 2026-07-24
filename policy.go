@@ -1,130 +1,96 @@
 package main
 
 import (
-	"math"
 	"strings"
 	"time"
 )
 
-// Isolation / trial phases for ban entries.
-// hard isolation is time-bounded (TTL + stepped cooldown) — never permanent by itself.
+// Three-state lifecycle (v1.5+):
+//
+//	available  — not in ban map
+//	cooling    — scheduler skip + CPA disable, auto-enable after TTL
+//	pending    — scheduler skip + stay disabled, NO auto-enable (manual unban or 403 delete)
+//
 // Permanent removal is only credential delete (HTTP 403 ops).
 const (
-	phaseIsolated = "isolated"
-	phaseTrial    = "trial"
+	phaseCooling = "cooling"
+	phasePending = "pending"
+
+	// Legacy phase names (migrated on load).
+	phaseIsolatedLegacy = "isolated"
+	phaseTrialLegacy    = "trial"
 )
 
-// evidenceLedger holds soft counters for accounts that are not (yet) isolated.
+// cycleLedger remembers consecutive cool-down rounds across enable→available
+// so MaxAutoCycles can still be reached. Not a debt score.
+type cycleLedger struct {
+	Cycle         int       `json:"cycle,omitempty"` // last completed/entered cool-down round (1-based)
+	UnusableSince time.Time `json:"unusable_since,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+}
+
+// evidenceLedger is retained only for unmarshaling pre-1.5 state files.
+// Runtime uses cycleLedger; debt/streak are ignored.
 type evidenceLedger struct {
 	DebtScore float64   `json:"debt_score,omitempty"`
 	Streak    int       `json:"streak,omitempty"`
-	Step      int       `json:"step,omitempty"` // last isolation step (0-based); survives healthy graduation
+	Step      int       `json:"step,omitempty"`
+	Cycle     int       `json:"cycle,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 func normalizePhase(phase string) string {
 	switch strings.TrimSpace(strings.ToLower(phase)) {
-	case phaseTrial:
-		return phaseTrial
-	case phaseIsolated, "":
-		// Legacy entries without phase are treated as isolated.
-		return phaseIsolated
+	case phasePending, "pending_cleanup", "pending-cleanup":
+		return phasePending
+	case phaseCooling, phaseIsolatedLegacy, "":
+		return phaseCooling
+	case phaseTrialLegacy:
+		// Trial accounts were already re-enabled; treat as cooling for migration
+		// (caller may promote high-cycle trial → pending).
+		return phaseCooling
 	default:
-		return phaseIsolated
+		return phaseCooling
 	}
 }
 
-func (c runtimeConfig) debtWeight(class string) float64 {
-	class = strings.TrimSpace(class)
-	if c.DebtWeights != nil {
-		if w, ok := c.DebtWeights[class]; ok {
-			return w
-		}
+func (c runtimeConfig) maxAutoCycles() int {
+	if c.MaxAutoCycles <= 0 {
+		return 3
 	}
-	switch class {
-	case classRateLimit:
-		return c.DebtFail429
-	case classPermission:
-		// Weight kept for diagnostics; one-shot classes isolate without needing debt threshold.
-		return c.DebtFail401
-	default:
-		return c.DebtFail401
-	}
+	return c.MaxAutoCycles
 }
 
-func (c runtimeConfig) isOneShotClass(class string) bool {
-	class = strings.TrimSpace(class)
-	if class == "" || len(c.OneShotClasses) == 0 {
-		return false
+// isolationDuration returns cool-down TTL for this cycle (1-based).
+// Default: fixed disable-hours (usually 24h). Optional CooldownSteps map cycle→ladder.
+func (c runtimeConfig) isolationDuration(class string, cycle int) time.Duration {
+	cap := c.durationForClass(class)
+	if cap <= 0 {
+		cap = 24 * time.Hour
 	}
-	_, ok := c.OneShotClasses[class]
-	return ok
-}
-
-// shouldIsolate decides whether accumulated evidence crosses the hard-isolation bar.
-// Permission (and other one-shot classes) isolate immediately but still with TTL — not permanent ban.
-func (c runtimeConfig) shouldIsolate(class string, debt float64, streak int) bool {
-	if !c.DebtEnabled {
-		return true
-	}
-	if c.isOneShotClass(class) {
-		return true
-	}
-	if c.StreakThreshold > 0 && streak >= c.StreakThreshold {
-		return true
-	}
-	if c.DebtThreshold > 0 && debt+1e-9 >= c.DebtThreshold {
-		return true
-	}
-	return false
-}
-
-func (c runtimeConfig) decayDebt(debt float64) float64 {
-	return math.Max(0, debt-c.DebtSuccessDecay)
-}
-
-// isolationDuration returns stepped cooldown, capped by class-disable-hours / disable-hours.
-// Steps default: 6h → 12h → 24h. step is 0-based and clamped to the last step.
-func (c runtimeConfig) isolationDuration(class string, step int) time.Duration {
 	steps := c.CooldownSteps
 	if len(steps) == 0 {
-		steps = defaultCooldownSteps()
+		return cap
 	}
-	if step < 0 {
-		step = 0
+	// cycle is 1-based → index 0 for first cool-down
+	idx := cycle - 1
+	if idx < 0 {
+		idx = 0
 	}
-	if step >= len(steps) {
-		step = len(steps) - 1
+	if idx >= len(steps) {
+		idx = len(steps) - 1
 	}
-	d := steps[step]
+	d := steps[idx]
 	if d <= 0 {
-		d = 6 * time.Hour
+		d = cap
 	}
-	cap := c.durationForClass(class)
-	if cap > 0 && d > cap {
+	if d > cap {
 		return cap
 	}
 	return d
 }
 
-func defaultCooldownSteps() []time.Duration {
-	return []time.Duration{6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
-}
-
 func defaultOneShotClasses() map[string]struct{} {
+	// Kept for config compatibility / docs: permission is fail-immediate like all classes.
 	return stringSet([]string{classPermission})
-}
-
-func defaultDebtWeights() map[string]float64 {
-	return map[string]float64{
-		classAuth:             1.5,
-		classPayment:          1.5,
-		classQuotaFree:        1.5,
-		classQuotaPaid:        1.5,
-		classPermission:       1.5,
-		classRateLimit:        0.5,
-		classForbiddenUnknown: 1.0,
-		classOther:            1.0,
-		classLegacy:           1.5,
-	}
 }
