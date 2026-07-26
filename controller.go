@@ -172,13 +172,20 @@ func (c *autobanController) run() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
+		// Prefer stop over wake/ticker so shutdown cannot race another process()
+		// that rewrites state.json while tests tear down t.TempDir().
 		select {
+		case <-c.stop:
+			return
+		default:
+		}
+		select {
+		case <-c.stop:
+			return
 		case <-c.wake:
 			c.process()
 		case <-ticker.C:
 			c.process()
-		case <-c.stop:
-			return
 		}
 	}
 }

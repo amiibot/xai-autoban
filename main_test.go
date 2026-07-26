@@ -245,12 +245,15 @@ func TestControllerDisablesAndReenablesAfterExpiry(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	// LIFO: TempDir first so shutdown runs before RemoveAll; server last so
+	// worker stops before HTTP closes.
+	stateDir := t.TempDir()
+	t.Cleanup(server.Close)
 
 	state := newBanState()
 	controller := newAutobanController(state)
 	t.Cleanup(controller.shutdown)
-	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nhalf-open-enabled: false\nstate-file: " + filepath.Join(t.TempDir(), "state.json") + "\n"
+	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nhalf-open-enabled: false\nstate-file: " + filepath.Join(stateDir, "state.json") + "\n"
 	if err := controller.configure([]byte(configYAML)); err != nil {
 		t.Fatal(err)
 	}
@@ -332,11 +335,12 @@ func TestPublicDeleteOnlyAllows403(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	stateDir := t.TempDir()
+	t.Cleanup(server.Close)
 
 	controller := newAutobanController(bans)
 	t.Cleanup(controller.shutdown)
-	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nstate-file: " + filepath.Join(t.TempDir(), "state.json") + "\n"
+	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nstate-file: " + filepath.Join(stateDir, "state.json") + "\n"
 	if err := controller.configure([]byte(configYAML)); err != nil {
 		t.Fatal(err)
 	}
@@ -410,11 +414,12 @@ func TestPublicDeleteAll403(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	stateDir := t.TempDir()
+	t.Cleanup(server.Close)
 
 	controller := newAutobanController(bans)
 	t.Cleanup(controller.shutdown)
-	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nstate-file: " + filepath.Join(t.TempDir(), "state.json") + "\n"
+	configYAML := "management-url: " + server.URL + "\nmanagement-key: secret\nstate-file: " + filepath.Join(stateDir, "state.json") + "\n"
 	if err := controller.configure([]byte(configYAML)); err != nil {
 		t.Fatal(err)
 	}
