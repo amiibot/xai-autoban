@@ -43,7 +43,7 @@ import (
 
 const (
 	pluginName    = "xai-autoban"
-	pluginVersion = "1.5.0"
+	pluginVersion = "1.5.1"
 	providerXAI   = "xai"
 
 	managementPrefix   = "/plugins/" + pluginName
@@ -1077,8 +1077,6 @@ func statusPage() string {
       }
       return {label:'冷却中·待停用',className:'management-pending',title:'本地已跳过调度，等待 CPA disable。\n本轮剩余：'+rem+tail};
     }
-
-    async function loadData
 
     async function loadData(silent=false){try{if(!silent){$('syncState').textContent='同步中';setMessage('正在加载实时状态...')}const data=await api('/data');state.bans=data.bans||[];state.deletable_classes=data.deletable_classes||['permission'];state.max_auto_cycles=Number(data.max_auto_cycles||2)||2;state.charts=data.charts||{by_status:[],by_class:[]};state.quota_join=data.quota_join||{};state.pool_total=data.pool_total||0;state.normal_count=data.normal_count||0;if($('poolTotal'))$('poolTotal').textContent=Number(state.pool_total||0).toLocaleString();if($('normalCount'))$('normalCount').textContent=Number(state.normal_count||0).toLocaleString();updateQuotaNote();drawCharts();for(const id of [...state.selected])if(!state.bans.some(x=>x.auth_id===id))state.selected.delete(id);const c=counts();$('total').textContent=data.count.toLocaleString();$('count401').textContent=c[401].toLocaleString();$('count402').textContent=c[402].toLocaleString();$('count403').textContent=c[403].toLocaleString();$('count429').textContent=c[429].toLocaleString();const managementError=data.management&&data.management.last_error;$('syncState').textContent=managementError?'管理接口异常':'已连接';setMessage(managementError||('最后更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false})),Boolean(managementError));render()}catch(error){$('syncState').textContent='连接异常';setMessage(error.message,true)}}
 

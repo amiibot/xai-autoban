@@ -66,6 +66,38 @@ func TestPublicStatusPageHasNoManagementAuthentication(t *testing.T) {
 	}
 }
 
+// Guard against the v1.3.6 / v1.5.0 class of bugs: a partial edit leaves broken JS so
+// loadData never runs and the header stays on the default 「正在连接」 forever.
+func TestStatusPageScriptHasCompleteLoadData(t *testing.T) {
+	page := statusPage()
+	const marker = "async function loadData"
+	idx := 0
+	count := 0
+	for {
+		i := strings.Index(page[idx:], marker)
+		if i < 0 {
+			break
+		}
+		pos := idx + i
+		count++
+		rest := page[pos+len(marker):]
+		if !strings.HasPrefix(strings.TrimLeft(rest, " \t"), "(") {
+			snippet := rest
+			if len(snippet) > 40 {
+				snippet = snippet[:40]
+			}
+			t.Fatalf("incomplete loadData declaration (would SyntaxError the whole panel script): %q%q", marker, snippet)
+		}
+		idx = pos + len(marker)
+	}
+	if count != 1 {
+		t.Fatalf("want exactly one loadData definition, got %d", count)
+	}
+	if !strings.Contains(page, "async function loadData(silent=false)") {
+		t.Fatal("status page missing complete loadData(silent=false) definition")
+	}
+}
+
 func TestResourceRoutesUseHostPluginID(t *testing.T) {
 	prefix := "/v0/resource/plugins/xai-autoban-linux-arm64"
 	tests := []struct {

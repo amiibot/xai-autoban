@@ -2,7 +2,7 @@
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 原生插件：在 xAI 凭据返回 `401/402/403/429` 时自动隔离，避免 CPA 在大号池里逐个重试坏号、拖长首 token。
 
-本仓库为 [vrxiaojie/xai-autoban](https://github.com/vrxiaojie/xai-autoban) 的 fork（amiibot），当前版本 **1.5.0**。
+本仓库为 [vrxiaojie/xai-autoban](https://github.com/vrxiaojie/xai-autoban) 的 fork（amiibot），当前版本 **1.5.1**。
 
 | | |
 | --- | --- |
@@ -225,6 +225,7 @@ bash build.sh
 
 | 版本 | 要点 |
 | --- | --- |
+| 1.5.1 | 修复面板 JS 半截 `loadData` 导致一直「正在连接」 |
 | 1.5.0 | 三态简化（可用/冷却/待清理）；失败即冷却；累计 token；表头排序 |
 | 1.4.3 | 导出 JSON/CSV（隔离 + state + 用量观测）供本地分析 |
 | 1.4.2 | 精简表列；当前处置文案澄清；悬停显示详情 |
